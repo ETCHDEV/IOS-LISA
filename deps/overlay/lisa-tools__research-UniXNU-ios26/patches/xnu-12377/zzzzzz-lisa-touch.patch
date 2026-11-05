@@ -1,0 +1,1421 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,3 +106,9 @@
+ bsd/dev/mem.c				standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/lisa_touch.c			standard
++bsd/dev/lisa_cpufreq.c			standard
++bsd/dev/sweet_keys.c			standard
++bsd/dev/lisa_stats.c			standard
++bsd/dev/sweet_rpmh.c			standard
++bsd/dev/lisa_geni_spi.c			standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/lisa_stats.c b/bsd/dev/lisa_stats.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/lisa_stats.c
+@@ -0,0 +1,99 @@
++/* Lisa: what the phone is doing, in the log every 10 s (boot-arg lisa-stats=1): CPU per core, memory, the busiest processes. */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc_internal.h>
++#include <sys/proc_info.h>
++#include <sys/bsdtask_info.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/processor.h>
++#include <mach/processor_info.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
++#pragma clang diagnostic ignored "-Wsign-conversion"
++#pragma clang diagnostic ignored "-Wshorten-64-to-32"
++extern processor_t cpu_to_processor(int cpu);
++extern kern_return_t processor_info(processor_t, processor_flavor_t, host_t *, processor_info_t, mach_msg_type_number_t *);
++extern unsigned int vm_page_free_count, vm_page_active_count, vm_page_inactive_count, vm_page_wire_count, vm_page_speculative_count;
++void lisa_stats_init(void);
++#define STAT_PIDS 2048
++static uint64_t stat_last[STAT_PIDS];
++struct stat_top { int pid; uint64_t ns; char name[20]; };
++static struct stat_top stat_tops[5];
++static int
++stat_proc(proc_t p, __unused void *arg)
++{
++	struct proc_taskinfo_internal info;
++	int pid = proc_pid(p);
++	task_t task = proc_task(p);
++
++	if (pid < 0 || pid >= STAT_PIDS || task == TASK_NULL ) {
++		return PROC_RETURNED;
++	}
++	fill_taskprocinfo(task, &info);
++	uint64_t now = info.pti_total_user + info.pti_total_system, delta = now - stat_last[pid];
++	stat_last[pid] = now;
++	for (int i = 0; i < 5; i++) {
++		if (delta > stat_tops[i].ns) {
++			memmove(&stat_tops[i + 1], &stat_tops[i], (4 - i) * sizeof(stat_tops[0]));
++			stat_tops[i].pid = pid;
++			stat_tops[i].ns = delta;
++			proc_name(pid, stat_tops[i].name, sizeof(stat_tops[i].name));
++			break;
++		}
++	}
++	return PROC_RETURNED;
++}
++static void
++stat_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static uint64_t last_busy[8], last_total[8];
++	static int chan;
++	for (;;) {
++		char line[200];
++		int used = 0;
++		uint64_t deadline;
++		clock_interval_to_deadline(10, NSEC_PER_SEC, &deadline);
++		(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++		for (int c = 0; c < 8; c++) {
++			processor_t processor = cpu_to_processor(c);
++			processor_cpu_load_info_data_t load;
++			mach_msg_type_number_t count = PROCESSOR_CPU_LOAD_INFO_COUNT;
++			host_t host;
++			if (processor == PROCESSOR_NULL || processor_info(processor, PROCESSOR_CPU_LOAD_INFO, &host,
++			    (processor_info_t)&load, &count) != KERN_SUCCESS) {
++				continue;
++			}
++			uint64_t busy = (uint64_t)load.cpu_ticks[CPU_STATE_USER] + load.cpu_ticks[CPU_STATE_SYSTEM] + load.cpu_ticks[CPU_STATE_NICE];
++			uint64_t total = busy + load.cpu_ticks[CPU_STATE_IDLE];
++			uint64_t db = busy - last_busy[c], dt = total - last_total[c];
++			last_busy[c] = busy;
++			last_total[c] = total;
++			used += snprintf(line + used, sizeof(line) - used, " %llu", dt ? db * 100 / dt : 0);
++		}
++		printf("lisa-stat: cpu%%%s | MiB free %u active %u inactive %u spec %u wired %u\\n", line,
++		    (unsigned)(vm_page_free_count * (PAGE_SIZE / 1024) / 1024), (unsigned)(vm_page_active_count * (PAGE_SIZE / 1024) / 1024),
++		    (unsigned)(vm_page_inactive_count * (PAGE_SIZE / 1024) / 1024), (unsigned)(vm_page_speculative_count * (PAGE_SIZE / 1024) / 1024),
++		    (unsigned)(vm_page_wire_count * (PAGE_SIZE / 1024) / 1024));
++		bzero(stat_tops, sizeof(stat_tops));
++		proc_iterate(PROC_ALLPROCLIST, stat_proc, NULL, NULL, NULL);
++		uint64_t all = 8ull * 192000000ull;   /* the times are 19.2 MHz ticks; 100 = all 8 cores for the 10 s */
++		printf("lisa-stat: top%% %s %llu %s %llu %s %llu %s %llu %s %llu\\\\n",
++		    stat_tops[0].name, stat_tops[0].ns * 100 / all, stat_tops[1].name, stat_tops[1].ns * 100 / all,
++		    stat_tops[2].name, stat_tops[2].ns * 100 / all, stat_tops[3].name, stat_tops[3].ns * 100 / all,
++		    stat_tops[4].name, stat_tops[4].ns * 100 / all);
++	}
++}
++void
++lisa_stats_init(void)
++{
++	int on = 0;
++	thread_t thread;
++	PE_parse_boot_argn("lisa-stats", &on, sizeof(on));
++	if (on == 1 && kernel_thread_start(stat_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_keys.c
+@@ -0,0 +1,129 @@
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
++#pragma clang diagnostic ignored "-Wsign-conversion"
++#pragma clang diagnostic ignored "-Wshorten-64-to-32"
++#pragma clang diagnostic ignored "-Wcast-qual"
++/* Lisa PMK8350 power and volume-down polling. No PMIC configuration writes.
++ * PON HLOS interrupt real-time status: SID 0, peripheral 0x13, offset 0x10.
++ * This opt-in prototype uses only observer EXT_READL commands and stops
++ * permanently on timeout.
++ * Volume-up (2026-10-26): PM7325 GPIO6, SID 1 peripheral 0x8d (GPIO base 0x8800 + 5 * 0x100),
++ * real-time status 0x10 bit 0 = input level (Linux pinctrl-spmi-gpio), active low. Read through
++ * the same observer channel; its own failure stops only volume-up.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++extern kern_return_t thread_terminate(thread_t);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++static void (*key_sink)(int, int);
++void lisa_keys_set_sink(void (*sink)(int, int));
++void lisa_keys_set_sink(void (*sink)(int, int)) { key_sink = sink; }
++static void sweet_hid_key(int key, int down) { if (key_sink) key_sink(key, down); }
++void sweet_keys_init(void);
++#define CORE_PA 0x0c440000u
++#define OBS_PA 0x0e600000u
++#define CFG_PA 0x0c40a000u
++static vm_offset_t core, obs, cfg;
++static uint16_t pon_apid = 0xffffu, vup_apid = 0xffffu;
++static bool vup_poisoned;
++static bool started, poisoned;
++static int sleep_chan;
++static uint32_t rd(vm_offset_t base, unsigned off) {
++ uint32_t v = *(volatile uint32_t *)(base + off);
++ __asm__ volatile("dmb oshld" ::: "memory"); return v;
++}
++static bool obs_read(uint16_t apid, unsigned reg, uint8_t *out, bool *poison) {
++ if (*poison || apid == 0xffffu) return false;
++ unsigned off = 0x80u * apid;
++ __asm__ volatile("dmb oshst" ::: "memory");
++ *(volatile uint32_t *)(obs + off) = (1u << 27) | (reg << 4);
++ __asm__ volatile("dsb osh" ::: "memory");
++ for (unsigned i = 0; i < 1000; i++) {
++  uint32_t status = rd(obs, off + 8);
++  if (status & 1u) {
++   if (status & 0x0eu) { *poison = true; return false; }
++   *out = (uint8_t)rd(obs, off + 0x18); return true;
++  }
++  delay(1);
++ }
++ *poison = true; return false;
++}
++static bool pon_read(uint8_t *out) {
++ if (poisoned || pon_apid == 0xffffu) return false;
++ unsigned off = 0x80u * pon_apid;
++ __asm__ volatile("dmb oshst" ::: "memory");
++ *(volatile uint32_t *)(obs + off) = (1u << 27) | (0x10u << 4);
++ __asm__ volatile("dsb osh" ::: "memory");
++ for (unsigned i = 0; i < 1000; i++) {
++  uint32_t status = rd(obs, off + 8);
++  if (status & 1u) {
++   if (status & 0x0eu) { poisoned = true; return false; }
++   *out = (uint8_t)rd(obs, off + 0x18); return true;
++  }
++  delay(1);
++ }
++ poisoned = true; printf("LISA KEYS: observer timeout; polling stopped\n"); return false;
++}
++static void keys_thread(void *arg, wait_result_t result) {
++ (void)arg; (void)result;
++ int power = 0, down = 0, up = 0;
++ while (!poisoned) {
++  uint8_t status;
++  if (pon_read(&status)) {
++   int p = !!(status & 0x80u), d = !!(status & 0x40u);
++   if (p != power) { power = p; sweet_hid_key(0, p); printf("LISA KEYS: power %d\n", p); }
++   if (d != down) { down = d; sweet_hid_key(2, d); printf("LISA KEYS: volume-down %d\n", d); }
++  }
++  uint8_t level;
++  if (obs_read(vup_apid, 0x10u, &level, &vup_poisoned)) {
++   int u = !(level & 1u);
++   if (u != up) { up = u; sweet_hid_key(1, u); printf("LISA KEYS: volume-up %d\n", u); }
++  } else if (vup_poisoned && vup_apid != 0xffffu) {
++   printf("LISA KEYS: volume-up read failed; volume-up polling stopped\n"); vup_apid = 0xffffu;
++  }
++  uint64_t deadline; clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++  (void)assert_wait_deadline(&sleep_chan, THREAD_UNINT, deadline);
++  thread_block(THREAD_CONTINUE_NULL);
++ }
++ (void)thread_terminate(current_thread());
++}
++void sweet_keys_init(void) {
++ int enabled = 0; thread_t thread;
++ if (started) return;
++ started = true;
++ PE_parse_boot_argn("lisakeys", &enabled, sizeof(enabled));
++ if (enabled != 1) return;
++ core = ml_io_map(CORE_PA, 0x2000); cfg = ml_io_map(CFG_PA, 0x1000);
++ obs = ml_io_map(OBS_PA, 0x10000);
++ if (!core || !cfg || !obs) { printf("LISA KEYS: map failed\n"); return; }
++ uint32_t version = rd(core, 0), count = rd(core, 4) & 0x7ffu;
++ if (version < 0x50000000u || version >= 0x70000000u || !count || count > 512) {
++  printf("LISA KEYS: unsupported arbiter %#x count %u\n", version, count); return;
++ }
++ for (unsigned i = 0; i < count; i++) {
++  uint32_t map = rd(core, 0x900u + 4u * i);
++  if (map && ((map >> 8) & 0xfffu) == 0x013u) {
++   unsigned owner = rd(cfg, 0x700u + 4u * i) & 7u;
++   if (pon_apid == 0xffffu || owner == 0) pon_apid = i;
++  }
++  if (map && ((map >> 8) & 0xfffu) == 0x18du) {
++   unsigned owner = rd(cfg, 0x700u + 4u * i) & 7u;
++   if (vup_apid == 0xffffu || owner == 0) vup_apid = i;
++  }
++ }
++ if (pon_apid == 0xffffu) { printf("LISA KEYS: PON APID absent\n"); return; }
++ uint8_t initial;
++ if (!pon_read(&initial)) { printf("LISA KEYS: PON read failed\n"); return; }
++ printf("LISA KEYS: PON APID %u status %#x; observer reads only\n", pon_apid, initial);
++ uint8_t vlevel = 0;
++ if (vup_apid == 0xffffu) printf("LISA KEYS: volume-up (PM7325 GPIO6, ppid 0x18d) APID absent\n");
++ else if (obs_read(vup_apid, 0x10u, &vlevel, &vup_poisoned)) printf("LISA KEYS: volume-up APID %u level %#x\n", vup_apid, vlevel);
++ else { printf("LISA KEYS: volume-up APID %u read failed\n", vup_apid); vup_apid = 0xffffu; }
++ kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
++ if (kr == KERN_SUCCESS) thread_deallocate(thread);
++ else printf("LISA KEYS: thread error %d\n", kr);
++}
+diff --git a/bsd/dev/lisa_cpufreq.c b/bsd/dev/lisa_cpufreq.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/lisa_cpufreq.c
+@@ -0,0 +1,220 @@
++/* Lisa EPSS: each core group to its top row, from lisa_cpufreq.c (iOS 16, same SoC); LMh firmware still limits thermally. boot-arg lisacpufreq=1. */
++#include <kern/clock.h>
++#include <mach/mach_types.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++#include <kern/kalloc.h>
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
++#pragma clang diagnostic ignored "-Wsign-conversion"
++#pragma clang diagnostic ignored "-Wshorten-64-to-32"
++#pragma clang diagnostic ignored "-Wunused-variable"
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++void lisa_cpufreq_init(void);
++extern void lisa_stats_init(void);
++#define EPSS_PHYS               0x18591000UL
++#define EPSS_DOMAIN_SIZE        0x1000UL
++#define EPSS_DOMAINS            3
++#define EPSS_FREQ_TABLE         0x100   /* a word per row: [31:30] clock source, [7:0] multiple of 19.2 MHz */
++#define EPSS_TABLE_ROWS         40
++#define EPSS_PERF_STATE         0x320   /* the row that is wanted */
++#define XO_KHZ                  19200
++#define ALTERNATE_KHZ           300000
++
++static vm_offset_t domain_base[EPSS_DOMAINS];
++static uint32_t domain_khz[EPSS_DOMAINS][EPSS_TABLE_ROWS];
++static uint32_t domain_rows[EPSS_DOMAINS], domain_row_now[EPSS_DOMAINS], domain_cap_row[EPSS_DOMAINS];
++
++static uint32_t
++loop_speed(void)
++{
++	volatile uint64_t sink = 0;
++	uint64_t start = mach_absolute_time(), nanos;
++
++	for (uint32_t i = 0; i < 2000000; i++) {
++		sink += i;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - start, &nanos);
++	return nanos ? (uint32_t)(2000000ULL * 1000 / nanos) : 0;
++}
++
++static uint32_t
++domain_of(uint32_t phys_id)
++{
++	uint32_t core = (phys_id >> 8) & 0xff;
++
++	return core < 4 ? 0 : core < 7 ? 1 : 2;
++}
++
++static void
++raise_domain(uint32_t domain, uint32_t cores, uint32_t cap_khz)
++{
++	uint32_t top = 0, top_khz = 0, was;
++	vm_offset_t base = ml_io_map(EPSS_PHYS + domain * EPSS_DOMAIN_SIZE, EPSS_DOMAIN_SIZE);
++
++	if (base == 0) {
++		printf("LISA CPUFREQ: group %u: map failed\n", domain);
++		return;
++	}
++	domain_base[domain] = base;
++	for (uint32_t row = 0; row < EPSS_TABLE_ROWS; row++) {
++		uint32_t entry = *(volatile uint32_t *)(base + EPSS_FREQ_TABLE + 4 * row);
++		uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
++
++		if (row > 0 && khz <= top_khz) {
++			break;          /* the table ends by repeating its last row */
++		}
++		if (cap_khz != 0 && khz > cap_khz) {
++			break;
++		}
++		top = row;
++		top_khz = khz;
++		domain_khz[domain][row] = khz;
++	}
++	domain_rows[domain] = top + 1;
++	domain_cap_row[domain] = top;
++	domain_row_now[domain] = top;
++	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
++	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
++	delay_for_interval(20, NSEC_PER_MSEC);
++	printf("LISA CPUFREQ: group %u (%u cores): row %u -> %u, %u MHz\n", domain, cores, was, top, top_khz / 1000);
++}
++
++
++
++/* Memory bandwidth: a vote through RPMh on MC0 and SH0 (hakios.cpufreq.c, same SoC: 12.4 -> 15.4 GB/s all cores). boot-arg lisa-ddr=0: none. */
++#define CMD_DB_PHYS 0x80860000UL
++#define CMD_DB_SIZE 0x20000UL
++#define DDR_RSC_PHYS 0x18220000UL
++#define BCM_COMMIT (1u << 30)
++#define BCM_VALID (1u << 29)
++#define BCM_VOTE(x, y) (BCM_COMMIT | BCM_VALID | ((uint32_t)(x) & 0x3fff) << 14 | ((uint32_t)(y) & 0x3fff))
++static vm_offset_t ddr_rsc;
++#define TCS_REG(reg) (ddr_rsc + 0xd00 + (reg))
++static uint32_t
++db16(volatile uint8_t *d, size_t at)
++{
++	return d[at] | (uint32_t)d[at + 1] << 8;
++}
++static uint32_t
++cmd_db_bcm(volatile uint8_t *d, const char *name)
++{
++	char id[8] = { 0 };
++	strlcpy(id, name, sizeof(id));
++	for (unsigned s = 0; s < 8; s++) {
++		size_t h = 8 + 16 * s;
++		size_t head = 144 + db16(d, h + 2), count = db16(d, h + 6);
++		if (db16(d, h) != 5 || count > 512 || head + count * 24 > CMD_DB_SIZE) {
++			continue;
++		}
++		for (size_t e = head; e < head + count * 24; e += 24) {
++			bool same = true;
++			for (unsigned k = 0; k < 8 && same; k++) {
++				same = d[e + k] == (uint8_t)id[k];
++			}
++			if (same) {
++				return db16(d, e + 16) | db16(d, e + 18) << 16;
++			}
++		}
++	}
++	return 0;
++}
++static bool
++ddr_rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
++{
++	uint32_t irq_enable = *(volatile uint32_t *)TCS_REG(0x00);
++	bool done = false;
++	for (int i = 0; *(volatile uint32_t *)TCS_REG(0x18) == 0; i++) {
++		if (i > 2000) {
++			return false;
++		}
++		delay_for_interval(100, NSEC_PER_USEC);
++	}
++	*(volatile uint32_t *)TCS_REG(0x14) &= ~(1u << 24);
++	*(volatile uint32_t *)TCS_REG(0x14) &= ~(1u << 16);
++	*(volatile uint32_t *)TCS_REG(0x08) = 1;
++	for (unsigned i = 0; i < count; i++) {
++		*(volatile uint32_t *)TCS_REG(0x30 + 20 * i) = 0x10008 | 0x100;
++		*(volatile uint32_t *)TCS_REG(0x34 + 20 * i) = address[i];
++		*(volatile uint32_t *)TCS_REG(0x38 + 20 * i) = data[i];
++	}
++	*(volatile uint32_t *)TCS_REG(0x10) = (1u << count) - 1;
++	*(volatile uint32_t *)TCS_REG(0x1c) = (1u << count) - 1;
++	*(volatile uint32_t *)TCS_REG(0x00) = irq_enable | 1;
++	*(volatile uint32_t *)TCS_REG(0x14) = 1u << 16;
++	*(volatile uint32_t *)TCS_REG(0x14) = 1u << 16 | 1u << 24;
++	for (int i = 0; i < 2000 && !done; i++) {
++		done = (*(volatile uint32_t *)TCS_REG(0x04) & 1) != 0;
++		if (!done) {
++			delay_for_interval(100, NSEC_PER_USEC);
++		}
++	}
++	*(volatile uint32_t *)TCS_REG(0x14) &= ~(1u << 24);
++	*(volatile uint32_t *)TCS_REG(0x14) &= ~(1u << 16);
++	*(volatile uint32_t *)TCS_REG(0x1c) = 0;
++	*(volatile uint32_t *)TCS_REG(0x10) = 0;
++	*(volatile uint32_t *)TCS_REG(0x08) = 1;
++	*(volatile uint32_t *)TCS_REG(0x00) = irq_enable;
++	return done;
++}
++static uint32_t
++mem_mbps(void)
++{
++	size_t bytes = 8u << 20;
++	void *a = kalloc_data(bytes, Z_WAITOK), *b = kalloc_data(bytes, Z_WAITOK);
++	uint32_t result = 0;
++	if (a && b) {
++		memset(a, 1, bytes);
++		memset(b, 2, bytes);
++		uint64_t start = mach_absolute_time(), nanos;
++		for (int i = 0; i < 16; i++) {
++			memcpy(i & 1 ? a : b, i & 1 ? b : a, bytes);
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - start, &nanos);
++		result = nanos ? (uint32_t)((uint64_t)bytes * 16 * 1000 / nanos) : 0;
++	}
++	if (a) kfree_data(a, bytes);
++	if (b) kfree_data(b, bytes);
++	return result;
++}
++static void
++ddr_raise(void)
++{
++	uint32_t on = 1, before = mem_mbps();
++	PE_parse_boot_argn("lisa-ddr", &on, sizeof(on));
++	if (on) {
++		volatile uint8_t *db = (volatile uint8_t *)ml_io_map(CMD_DB_PHYS, CMD_DB_SIZE);
++		uint32_t address[3] = { cmd_db_bcm(db, "MC0"), cmd_db_bcm(db, "SH0"), cmd_db_bcm(db, "ACV") };
++		uint32_t data[3] = { BCM_VOTE(0x3fff, 0x3fff), BCM_VOTE(0x3fff, 0x3fff), BCM_VOTE(0, 8) };
++		ddr_rsc = ml_io_map(DDR_RSC_PHYS, 0x4000);
++		bool done = address[0] && address[1] && address[2] && ddr_rsc && ddr_rpmh_write(address, data, 3);
++		printf("LISA DDR: vote MC0 %#x SH0 %#x ACV %#x %s\\n", address[0], address[1], address[2], done ? "done" : "FAILED");
++	}
++	printf("LISA DDR: copy on this core %u MB/s before, %u MB/s after\\n", before, mem_mbps());
++}
++void
++lisa_cpufreq_init(void)
++{
++	static int done;
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	uint32_t enabled = 0, cap_mhz = 0, cores[EPSS_DOMAINS] = { 0 }, before;
++
++	if (done || !PE_parse_boot_argn("lisacpufreq", &enabled, sizeof(enabled)) || enabled != 1) {
++		return;
++	}
++	done = 1;
++	PE_parse_boot_argn("lisacpufreq_cap", &cap_mhz, sizeof(cap_mhz));
++	for (unsigned int i = 0; i < topology->num_cpus; i++) {
++		cores[domain_of(topology->cpus[i].phys_id)]++;
++	}
++	before = loop_speed();
++	for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
++		if (cores[domain] != 0) {
++			raise_domain(domain, cores[domain], cap_mhz * 1000);
++		}
++	}
++	printf("LISA CPUFREQ: a loop on this core ran at %u, now at %u\n", before, loop_speed());
++	{ uint64_t isar1; __asm__ volatile("mrs %0, ID_AA64ISAR1_EL1" : "=r"(isar1)); printf("LISA CPU: ISAR1 %#llx: pointer auth APA %llu API %llu GPA %llu GPI %llu\\n", isar1, (isar1 >> 4) & 15, (isar1 >> 8) & 15, (isar1 >> 24) & 15, (isar1 >> 28) & 15); }
++	ddr_raise();
++	lisa_stats_init();
++}
+diff --git a/bsd/dev/lisa_touch.c b/bsd/dev/lisa_touch.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/lisa_touch.c
+@@ -0,0 +1,371 @@
++/* Lisa GT9897T touch for xnu-12377, from sweet_touch.c (iOS 16 hardware log: GPIO SPI input 52, event 0x10338).
++ * Polled worker thread; publishes through UniXNU's native_touch_* seqlock (0..32767), read by kits/zeta/HidInputProbe. */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "lisa_goodix_berlin.h"
++#include "lisa_geni_spi.h"
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
++#pragma clang diagnostic ignored "-Wcast-qual"
++#pragma clang diagnostic ignored "-Wsign-conversion"
++#pragma clang diagnostic ignored "-Wshorten-64-to-32"
++#pragma clang diagnostic ignored "-Wunused-function"
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void delay(int);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++void lisa_touch_init(void);
++#define TOUCH_MAX 10u
++volatile unsigned int native_touch_seq, native_touch_count, native_touch_hid_reports;
++volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
++static void (*touch_sink)(void *);
++static void *touch_sink_context;
++void native_touch_set_sink(void (*sink)(void *), void *context) { touch_sink_context = context; __asm__ volatile("dmb ish" ::: "memory"); touch_sink = sink; }
++static struct { uint32_t active; int x[TOUCH_MAX], y[TOUCH_MAX]; } st;
++static int touch_sleep_chan;
++typedef int (*lisa_goodix_read_fn)(void *, uint32_t, uint8_t *, size_t);
++typedef int (*lisa_goodix_write_fn)(void *, uint32_t, const uint8_t *, size_t);
++typedef int (*lisa_spi_exchange_fn)(void *, const uint8_t *, uint8_t *, size_t);
++struct lisa_goodix_spi_bus { void *context; lisa_spi_exchange_fn exchange; uint32_t event_address; };
++int lisa_goodix_feed(const uint8_t *data, size_t length);
++int lisa_goodix_event_address(const uint8_t *data, size_t length, uint32_t *address);
++
++static uint32_t
++touch_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++touch_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* The whole finger set after each frame; HidInputProbe sends tip-ups for identifiers that left it. */
++static void
++touch_report(uint32_t mask, const int *x, const int *y)
++{
++	unsigned count = 0;
++	native_touch_seq = native_touch_seq + 1;
++	__asm__ volatile("dmb ish" ::: "memory");
++	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++		if (!(mask & (1u << id))) continue;
++		native_touch_ids[count] = (int)id;
++		native_touch_xs[count] = x[id] * 32767 / 1079;
++		native_touch_ys[count] = y[id] * 32767 / 2399;
++		st.x[id] = x[id]; st.y[id] = y[id];
++		count++;
++	}
++	native_touch_count = count;
++	__asm__ volatile("dmb ish" ::: "memory");
++	native_touch_seq = native_touch_seq + 1;
++	bool changed = st.active != mask || count;
++	st.active = mask;
++	void (*sink)(void *) = touch_sink;
++	if (changed && sink) sink(touch_sink_context);
++}
++
++int
++lisa_goodix_feed(const uint8_t *data, size_t length)
++{
++	struct lisa_touch_frame frame;
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	int result = lisa_touch_decode(data, length, &frame);
++	if (result != 0) {
++		return result;
++	}
++	for (unsigned int i = 0; i < frame.count; ++i) {
++		struct lisa_touch_point *p = &frame.points[i];
++		if (p->x > 1080 || p->y > 2400) {
++			return -1;
++		}
++		mask |= 1u << p->id;
++		x[p->id] = p->x;
++		y[p->id] = p->y;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++int
++lisa_goodix_read_command(uint8_t *tx, size_t capacity, uint32_t address, size_t length)
++{
++	return lisa_touch_spi_read_frame(tx, capacity, address, length);
++}
++
++int
++lisa_goodix_event_address(const uint8_t *data, size_t length, uint32_t *address)
++{
++	return lisa_touch_info_address(data, length, address);
++}
++
++/* All I/O is delegated to a future Lisa SPI transport. The caller serializes
++ * polls on the touch worker and supplies an already discovered event address. */
++int
++lisa_goodix_poll(void *context, uint32_t address, lisa_goodix_read_fn read_fn,
++    lisa_goodix_write_fn write_fn)
++{
++	uint8_t data[8 + LISA_TOUCH_MAX * 8 + 2];
++	struct lisa_touch_frame frame;
++	const uint8_t clear = 0;
++	if (!address || address > UINT32_MAX - sizeof(data) || !read_fn || !write_fn) {
++		return -1;
++	}
++	if (read_fn(context, address, data, 26) != 0) {
++		return -1;
++	}
++	if (!data[0]) {
++		return 1;
++	}
++	if (!lisa_touch_checksum(data, 8) || !(data[0] & 0x80)) {
++		return -1;
++	}
++	unsigned count = data[2] & 15;
++	if (count > LISA_TOUCH_MAX) {
++		return -1;
++	}
++	if (count > 2 && read_fn(context, address + 26, data + 26, (count - 2) * 8) != 0) {
++		return -1;
++	}
++	size_t length = count ? 8 + count * 8 + 2 : 8;
++	if (lisa_touch_decode(data, length, &frame) != 0) {
++		return -1;
++	}
++	for (unsigned i = 0; i < frame.count; i++) {
++		if (frame.points[i].x > 1080 || frame.points[i].y > 2400) {
++			return -1;
++		}
++	}
++	if (write_fn(context, address, &clear, 1) != 0) {
++		return -1;
++	}
++	return lisa_goodix_feed(data, length);
++}
++
++/* GT9897 (Berlin-A) uses four dummy bytes; GT9916 (Berlin-D) uses three.
++ * The callback must keep chip select asserted for the complete transfer.
++ * This adapter has no hardware backend until Lisa's GENI driver is wired. */
++int
++lisa_goodix_spi_read(void *context, uint32_t address, uint8_t *out, size_t length)
++{
++	struct lisa_goodix_spi_bus *bus = context;
++	uint8_t tx[9 + 1024] = {0}, rx[9 + 1024];
++	if (!bus || !bus->exchange || !out || !length || length > 1024 ||
++	    length - 1 > UINT32_MAX - address) {
++		return -1;
++	}
++	tx[0] = 0xf1;
++	for (unsigned i = 0; i < 4; ++i) {
++		tx[1 + i] = (uint8_t)(address >> (24 - 8 * i));
++		tx[5 + i] = 0xff;
++	}
++	if (bus->exchange(bus->context, tx, rx, length + 9)) {
++		return -1;
++	}
++	memcpy(out, rx + 9, length);
++	return 0;
++}
++
++/* The only permitted device write is acknowledgement of a validated event. */
++int
++lisa_goodix_spi_ack(void *context, uint32_t address, const uint8_t *data, size_t length)
++{
++	struct lisa_goodix_spi_bus *bus = context;
++	uint8_t tx[6] = {0xf0, 0, 0, 0, 0, 0}, rx[6];
++	if (!bus || !bus->exchange || !bus->event_address ||
++	    address != bus->event_address || !data || length != 1 || *data) {
++		return -1;
++	}
++	for (unsigned i = 0; i < 4; ++i) {
++		tx[1 + i] = (uint8_t)(address >> (24 - 8 * i));
++	}
++	return bus->exchange(bus->context, tx, rx, sizeof(tx)) ? -1 : 0;
++}
++
++/* Berlin-A IC-info is at 0x10068, not Berlin-D's 0x10070. A valid,
++ * checksummed table must name the event address before acknowledgements. */
++int
++lisa_goodix_spi_discover(struct lisa_goodix_spi_bus *bus)
++{
++	uint8_t info[1024];
++	uint32_t address = 0;
++	if (!bus) {
++		return -1;
++	}
++	bus->event_address = 0;
++	if (lisa_goodix_spi_read(bus, 0x10068, info, 2)) {
++		return -1;
++	}
++	size_t length = lisa_touch_le16(info);
++	if (length < 2 || length >= sizeof(info) ||
++	    lisa_goodix_spi_read(bus, 0x10068, info, length) ||
++	    lisa_goodix_event_address(info, length, &address)) {
++		return -1;
++	}
++	bus->event_address = address;
++	return 0;
++}
++
++struct lisa_touch_hw { vm_offset_t se, gcc, tlmm; struct lisa_geni_spi geni; struct lisa_goodix_spi_bus bus; };
++static struct lisa_touch_hw lisa_hw;
++static uint32_t lisa_se_read(void *p, uint32_t off) { struct lisa_touch_hw *h = p; return touch_rd(h->se, off); }
++static void lisa_se_write(void *p, uint32_t off, uint32_t v) { struct lisa_touch_hw *h = p; touch_wr(h->se, off, v); }
++static void lisa_delay(void *p, unsigned us) { (void)p; delay(us); }
++static void lisa_gpio(unsigned pin, unsigned function, unsigned pull, unsigned drive, bool output, bool high)
++{
++	uint32_t cfg = pull | function << 2 | (drive / 2 - 1) << 6 | (output ? 1u << 9 : 0);
++	if (output) touch_wr(lisa_hw.tlmm, pin * 0x1000u + 4u, high ? 2u : 0u);
++	touch_wr(lisa_hw.tlmm, pin * 0x1000u, cfg);
++}
++/* Software SPI is a bounded fallback when the inherited QUP clock cannot be
++ * enabled.  It uses only the four touchscreen pins and the existing worker. */
++static unsigned lisa_spi_input = 52, lisa_spi_output = 53;
++static void lisa_pin_set(unsigned pin, bool high)
++{
++	touch_wr(lisa_hw.tlmm, pin * 0x1000u + 4u, high ? 2u : 0u);
++}
++static int lisa_gpio_spi_exchange(void *unused, const uint8_t *tx, uint8_t *rx, size_t length)
++{
++	(void)unused;
++	if (!tx || !length || length > 1033) return -1;
++	lisa_pin_set(55, false);
++	for (size_t i = 0; i < length; ++i) {
++		uint8_t in = 0;
++		for (int bit = 7; bit >= 0; --bit) {
++			lisa_pin_set(lisa_spi_output, (tx[i] >> bit) & 1);
++			delay(1);
++			lisa_pin_set(54, true);
++			delay(1);
++			in = (uint8_t)((in << 1) | (touch_rd(lisa_hw.tlmm, lisa_spi_input * 0x1000u + 4u) & 1));
++			lisa_pin_set(54, false);
++		}
++		if (rx) rx[i] = in;
++	}
++	lisa_pin_set(55, true);
++	return 0;
++}
++static void lisa_gpio_spi_init(unsigned input)
++{
++	lisa_spi_input = input;
++	lisa_spi_output = input == 52 ? 53 : 52;
++	lisa_gpio(55, 0, 0, 6, true, true);
++	lisa_gpio(54, 0, 0, 6, true, false);
++	lisa_gpio(lisa_spi_output, 0, 0, 6, true, false);
++	lisa_gpio(lisa_spi_input, 0, 0, 2, false, false);
++}
++static uint32_t lisa_clock_rate(uint32_t cfg, uint32_t m, uint32_t inverse_n)
++{
++	static const uint32_t parent[8] = {19200000, 600000000, 0, 0, 0, 0, 300000000, 0};
++	uint64_t hz = parent[(cfg >> 8) & 7];
++	uint32_t div = cfg & 31, mode = (cfg >> 12) & 3;
++	if (div) hz = hz * 2 / (div + 1);
++	if (mode) { uint32_t n = (~inverse_n & 0xffff) + (m & 0xffff); if (!n) return 0; hz = hz * (m & 0xffff) / n; }
++	return (uint32_t)hz;
++}
++static bool lisa_touch_clocks(uint32_t *rate, uint32_t *selection)
++{
++	vm_offset_t g = lisa_hw.gcc;
++	uint32_t vote = touch_rd(g, 0x52008);
++	if (vote == UINT32_MAX) return false;
++	touch_wr(g, 0x52008, vote | (15u << 18));
++	*rate = 0; *selection = 0;
++	if (touch_rd(g, 0x18614) & 1) {
++		for (uint32_t n = 0; n < 8; ++n) {
++			uint32_t hz = lisa_clock_rate(touch_rd(g, 0x1861c + 4*n), touch_rd(g, 0x1865c + 4*n), touch_rd(g, 0x1869c + 4*n));
++			if (hz >= 4000000 && (!*rate || hz < *rate)) { *rate = hz; *selection = n; }
++		}
++	} else {
++		touch_wr(g, 0x18604, (touch_rd(g, 0x18604) & ~0x371fu) | 1u);
++		touch_wr(g, 0x18600, touch_rd(g, 0x18600) | 1u);
++		for (unsigned i = 0; i < 500 && (touch_rd(g, 0x18600) & 1); ++i) delay(10);
++		if (touch_rd(g, 0x18600) & 1) return false;
++		*rate = 19200000;
++	}
++	if (!*rate) return false;
++	touch_wr(g, 0x52008, touch_rd(g, 0x52008) | (1u << 27));
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t clocks = touch_rd(g, 0x18004) | touch_rd(g, 0x18008) | touch_rd(g, 0x185fc);
++		if (!(clocks & 0x80000000u)) return true;
++		delay(10);
++	}
++	return false;
++}
++static void lisa_touch_thread(void *arg, wait_result_t result)
++{
++	(void)arg; (void)result;
++	touch_wait(20000); /* Let display and persistent logging start first. */
++	lisa_hw.se = ml_io_map(0x00a94000u, 0x4000);
++	lisa_hw.gcc = ml_io_map(0x00100000u, 0x60000);
++	lisa_hw.tlmm = ml_io_map(0x0f100000u, 0x100000);
++	if (!lisa_hw.se || !lisa_hw.gcc || !lisa_hw.tlmm) goto out;
++	/* Assert reset while power settles; measurements from Lisa recovery. */
++	lisa_gpio(105, 0, 3, 8, true, false);
++	lisa_gpio(81, 0, 3, 8, false, false);
++	if (sweet_rpmh_vreg_enable("ldoc2", 1800)) goto out;
++	touch_wait(3);
++	if (sweet_rpmh_vreg_enable("ldoc7", 3300)) goto out;
++	touch_wait(15);
++	lisa_gpio(105, 0, 3, 8, true, true);
++	touch_wait(100);
++	uint32_t rate, selection;
++	bool found = false;
++	if (lisa_touch_clocks(&rate, &selection)) {
++		for (unsigned pin = 52; pin <= 55; ++pin) lisa_gpio(pin, 1, 0, 6, false, false);
++		lisa_hw.geni = (struct lisa_geni_spi){&lisa_hw, lisa_se_read, lisa_se_write, lisa_delay, 0};
++		if (!lisa_geni_spi_init(&lisa_hw.geni, rate, selection, 1000000)) {
++			lisa_hw.bus = (struct lisa_goodix_spi_bus){&lisa_hw.geni, lisa_geni_spi_exchange, 0};
++			found = !lisa_goodix_spi_discover(&lisa_hw.bus);
++		}
++	} else printf("LISA TOUCH: clocks unavailable, trying GPIO SPI\n");
++	if (!found) {
++		lisa_hw.bus = (struct lisa_goodix_spi_bus){NULL, lisa_gpio_spi_exchange, 0};
++		/* Do not swap input and output: driving the controller's output
++		 * could cause contention.  These are the QUP1 SE5 pin roles. */
++		lisa_gpio_spi_init(52);
++		found = !lisa_goodix_spi_discover(&lisa_hw.bus);
++		printf("LISA TOUCH: GPIO SPI input 52 %s\n", found ? "identified" : "no valid IC info");
++	}
++	if (!found) goto out;
++	printf("LISA TOUCH: GT9897 event register %#x\n", lisa_hw.bus.event_address);
++	for (unsigned errors = 0;;) {
++		int r = lisa_goodix_poll(&lisa_hw.bus, lisa_hw.bus.event_address, lisa_goodix_spi_read, lisa_goodix_spi_ack);
++		if (r < 0 && ++errors == 10) { touch_report(0, st.x, st.y); printf("LISA TOUCH: repeated SPI errors\n"); break; }
++		if (r >= 0) errors = 0;
++		/* Input latency: while a finger is down (an event frame, r == 0) poll every 4 ms
++		 * (250 Hz) for half a second after the last event; idle, every 10 ms as before. */
++		static unsigned hot;
++		if (r == 0) hot = 125;
++		if (hot) { hot--; touch_wait(4); } else touch_wait(10);
++	}
++out:
++	printf("LISA TOUCH: worker stopped\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++void lisa_touch_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (!PE_parse_boot_argn("lisatouch", &enabled, sizeof(enabled)) || enabled != 1) return;
++	if (kernel_thread_start(lisa_touch_thread, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
++}
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_rpmh.c
+@@ -0,0 +1,363 @@
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
++#pragma clang diagnostic ignored "-Wsign-conversion"
++#pragma clang diagnostic ignored "-Wshorten-64-to-32"
++#pragma clang diagnostic ignored "-Wcast-qual"
++/*
++ * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
++ * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
++ * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++
++/* Live downstream DT has two positional reg entries, no reg-names. */
++#define RH_RSC_PA       0x18220000u
++#define RH_TCS_PA       0x18220d00u
++#define RH_TCS_SIZE     0x3000u
++#define RH_DICT_PA      0x0c3f000cu
++#define RH_DRV          2u
++#define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
++#define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */
++#define RH_TCS_STRIDE   0x2a0u
++#define RH_CMD_STRIDE   0x14u
++#define RH_IRQ_EN       0x00u
++#define RH_IRQ_STATUS   0x04u
++#define RH_IRQ_CLEAR    0x08u
++#define RH_WAIT         0x10u
++#define RH_CONTROL      0x14u
++#define RH_STATUS       0x18u
++#define RH_ENABLE       0x1cu
++#define RH_MSGID        0x30u
++#define RH_ADDR         0x34u
++#define RH_DATA         0x38u
++#define RH_CMD_STATUS   0x3cu
++#define RH_AMC_EN       (1u << 16)
++#define RH_TRIGGER      (1u << 24)
++#define RH_ISSUED       (1u << 8)
++#define RH_COMPLETE     (1u << 16)
++#define RH_WRITE_ACK    (8u | (1u << 8) | (1u << 16))
++#define RH_DB_MAGIC     0x0c0330dbu
++#define RH_DB_HEADER    144u
++#define RH_DB_ENTRY     24u
++#define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
++#define RH_VRM          4u
++#define RH_TIMEOUT_US   100000u
++
++static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
++static uint32_t rh_db_size;
++static unsigned rh_ncpt;
++static unsigned rh_lock;
++static bool rh_poisoned;
++
++static uint32_t
++rh_read(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++rh_write(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static bool
++rh_sync(uint32_t off, uint32_t value)
++{
++	rh_write(rh_tcs, off, value);
++	for (unsigned i = 0; i < 1000; ++i) {
++		if (rh_read(rh_tcs, off) == value) {
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET RPMH: readback timeout off=%#x want=%#x got=%#x\n",
++	    off, value, rh_read(rh_tcs, off));
++	return false;
++}
++
++/* DB is little endian; avoid packed structs and unaligned Device loads. */
++static uint16_t
++rh_db16(uint32_t off)
++{
++	uint32_t v = rh_read(rh_db, off & ~3u);
++	return (uint16_t)(v >> (8u * (off & 3u)));
++}
++
++static bool
++rh_range(uint32_t off, uint32_t size)
++{
++	return off <= rh_db_size && size <= rh_db_size - off;
++}
++
++static int
++rh_map(void)
++{
++	if (!rh_rsc) {
++		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
++	}
++	if (!rh_tcs) {
++		rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
++	}
++	if (!rh_dict) {
++		rh_dict = ml_io_map(RH_DICT_PA, 8);
++	}
++	if (!rh_rsc || !rh_tcs || !rh_dict) {
++		printf("SWEET RPMH: RSC/locator mapping failed\n");
++		return ENOMEM;
++	}
++	uint32_t id = rh_read(rh_rsc, 0);
++	uint32_t solver = rh_read(rh_rsc, 4);
++	uint32_t config = rh_read(rh_rsc, 0x0c);
++	unsigned major = (id >> 16) & 0xffu;
++	unsigned count = (config >> (6u * RH_DRV)) & 0x3fu;
++	rh_ncpt = (config >> 27) & 0x1fu;
++	printf("SWEET RPMH: rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
++	    RH_RSC_PA, RH_TCS_PA, RH_DRV, id, solver, config, count, rh_ncpt);
++	/* This client implements the pre-v3 layout only; do not guess v3 offsets. */
++	if ((major != 1 && major != 2) || config == 0xffffffffu ||
++	    solver == 0xffffffffu || count < RH_NORMAL_N ||
++	    count > RH_TCS_SIZE / RH_TCS_STRIDE || rh_ncpt < 3 || rh_ncpt > 16) {
++		printf("SWEET RPMH: unsupported RSC geometry/revision\n");
++		return ENODEV;
++	}
++	if (!rh_db) {
++		uint32_t pa = rh_read(rh_dict, 0);
++		uint32_t size = rh_read(rh_dict, 4);
++		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
++		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
++		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
++		    size < RH_DB_HEADER || size > RH_DB_MAX ||
++		    (uint64_t)pa + size > 0x100000000ULL) {
++			printf("SWEET RPMH: invalid cmd-db locator\n");
++			return EINVAL;
++		}
++		rh_db = ml_io_map(pa, size);
++		if (!rh_db) {
++			return ENOMEM;
++		}
++		rh_db_size = size;
++	}
++	uint32_t db_version = rh_read(rh_db, 0);
++	uint32_t magic = rh_read(rh_db, 4);
++	uint32_t flags = rh_read(rh_db, 140);
++	printf("SWEET RPMH: cmd-db version=%#x magic=%#x checksum=%#x flags=%#x\n",
++	    db_version, magic, rh_read(rh_db, 136), flags);
++	/* Linux only checks magic; version 1 is an intentionally stricter policy. */
++	if (magic != RH_DB_MAGIC || db_version != 1 || (flags & 1u)) {
++		printf("SWEET RPMH: unsupported/standalone cmd-db\n");
++		return EINVAL;
++	}
++	return 0;
++}
++
++static int
++rh_lookup(const char *res, uint32_t *address)
++{
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	unsigned matches = 0;
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3u) ||
++		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			printf("SWEET RPMH: malformed cmd-db slave header %u\n", i);
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = rh_read(rh_db, e + 16);
++			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
++				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				return EINVAL;
++			}
++			*address = addr;
++			++matches;
++			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
++			    res, addr, slave, rh_db16(h + 8),
++			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
++		}
++	}
++	if (matches != 1) {
++		printf("SWEET RPMH: %s lookup matches=%u; refusing\n", res, matches);
++		return ENODEV;
++	}
++	return 0;
++}
++
++static bool
++rh_free(unsigned t)
++{
++	uint32_t b = t * RH_TCS_STRIDE;
++	/* Idle alone is insufficient: a sleep/wake payload can be armed and idle. */
++	return rh_read(rh_tcs, b + RH_STATUS) != 0 &&
++	    rh_read(rh_tcs, b + RH_STATUS) != 0xffffffffu &&
++	    rh_read(rh_tcs, b + RH_CONTROL) == 0 &&
++	    rh_read(rh_tcs, b + RH_ENABLE) == 0 &&
++	    rh_read(rh_tcs, b + RH_WAIT) == 0 &&
++	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
++}
++
++static int
++rh_send(uint32_t address, unsigned mv)
++{
++	int chosen = -1;
++	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
++		uint32_t b = t * RH_TCS_STRIDE;
++		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
++		printf("SWEET RPMH: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
++		    t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
++		    enabled, rh_read(rh_tcs, b + RH_WAIT));
++		if (enabled & ~((1u << rh_ncpt) - 1u)) {
++			return EIO;
++		}
++		for (unsigned c = 0; c < rh_ncpt; ++c) {
++			if ((enabled & (1u << c)) &&
++			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
++				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				return EBUSY;
++			}
++		}
++		if (chosen < 0 && rh_free(t)) {
++			chosen = (int)t;
++		}
++	}
++	if (chosen < 0) {
++		printf("SWEET RPMH: no empty idle ACTIVE TCS; leaving inherited state intact\n");
++		return EBUSY;
++	}
++	unsigned t = (unsigned)chosen;
++	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
++	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
++	if (irq_en == 0xffffffffu || !rh_free(t)) {
++		return EBUSY;
++	}
++	/* Only this TCS's source is masked. Other sources/CPU IRQs remain intact. */
++	if (!rh_sync(RH_IRQ_EN, irq_en & ~bit)) {
++		rh_poisoned = true;
++		return EIO;
++	}
++	if (!rh_free(t)) {
++		/* No payload was touched. Do not acknowledge somebody else's IRQ. */
++		if (!rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++			rh_poisoned = true;
++		}
++		return EBUSY;
++	}
++	/* From here an uncertain write/timeout quarantines our slot for this boot. */
++	rh_poisoned = true;
++	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++	const uint32_t offsets[3] = {0, 8, 4};
++	const uint32_t values[3] = {mv, 7, 1};
++	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
++	for (unsigned c = 0; c < 3; ++c) {
++		uint32_t cmd = b + c * RH_CMD_STRIDE;
++		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
++		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
++		    !rh_sync(cmd + RH_DATA, values[c])) {
++			return EIO;
++		}
++	}
++	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, b + RH_CONTROL, RH_AMC_EN | RH_TRIGGER);
++	uint32_t irq = 0, idle = 0, status[3] = {0, 0, 0};
++	bool done = false, progress = false;
++	for (unsigned us = 0; us < RH_TIMEOUT_US; ++us) {
++		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
++		idle = rh_read(rh_tcs, b + RH_STATUS);
++		bool complete = true;
++		for (unsigned c = 0; c < 3; ++c) {
++			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
++			complete &= status[c] != 0xffffffffu &&
++			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
++		}
++		/* A fresh IRQ or observed execution transition excludes stale CMD_STATUS. */
++		progress |= idle == 0 || !complete;
++		if (idle && idle != 0xffffffffu && irq != 0xffffffffu &&
++		    ((irq & bit) || progress) && complete) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
++	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	if (!done) {
++		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
++		return ETIMEDOUT;
++	}
++	/* Proven completion: clear trigger before mode, then free only our commands. */
++	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
++		return EIO;
++	}
++	rh_write(rh_tcs, RH_IRQ_CLEAR, bit); /* W1C: never clear other TCS bits */
++	if ((rh_read(rh_tcs, RH_IRQ_STATUS) & bit) ||
++	    !rh_sync(RH_IRQ_EN, (rh_read(rh_tcs, RH_IRQ_EN) & ~bit) | (irq_en & bit))) {
++		return EIO;
++	}
++	rh_poisoned = false;
++	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	return 0;
++}
++
++int
++sweet_rpmh_vreg_enable(const char *res, unsigned mv)
++{
++	/* Lisa GT9897 rails measured in recovery: L2=1800 mV, L7=3300 mV.
++	 * Keep the original Sweet L11 restriction for the inherited driver. */
++	if (!res || !((!strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400) ||
++	    (!strcmp(res, "ldoc2") && mv == 1800) ||
++	    (!strcmp(res, "ldoc7") && mv == 3300))) {
++		printf("SWEET RPMH: unsupported resource or voltage\n");
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, &address);
++	}
++	if (!error) {
++		error = rh_send(address, mv);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: enable failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+diff --git a/bsd/dev/lisa_goodix_berlin.h b/bsd/dev/lisa_goodix_berlin.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/lisa_goodix_berlin.h
+@@ -0,0 +1,92 @@
++/* Goodix Berlin-A event decoder for Lisa bring-up. No hardware access.
++ * Format reference: Linux goodix_berlin_core.c (GPL-2.0-or-later).
++ * This decoder is experimental until verified against Lisa's controller.
++ */
++#ifndef LISA_GOODIX_BERLIN_H
++#define LISA_GOODIX_BERLIN_H
++#include <stddef.h>
++#include <stdint.h>
++
++#define LISA_TOUCH_MAX 10
++struct lisa_touch_point { uint8_t id; uint16_t x, y, width; };
++struct lisa_touch_frame { uint8_t count; struct lisa_touch_point points[LISA_TOUCH_MAX]; };
++
++static uint16_t lisa_touch_le16(const uint8_t *p)
++{
++    return (uint16_t)(p[0] | (uint16_t)p[1] << 8);
++}
++
++/* Berlin-A uses a full-duplex read, with four dummy bytes after the address.
++ * The caller clocks exactly prefix + payload bytes in one chip-select window. */
++static int lisa_touch_spi_read_frame(uint8_t *tx, size_t capacity,
++    uint32_t address, size_t payload_len)
++{
++    const size_t prefix = 9;
++    if (!tx || payload_len > capacity || capacity - payload_len < prefix) return -1;
++    tx[0] = 0xf1;
++    tx[1] = (uint8_t)(address >> 24);
++    tx[2] = (uint8_t)(address >> 16);
++    tx[3] = (uint8_t)(address >> 8);
++    tx[4] = (uint8_t)address;
++    for (size_t i = 5; i < prefix; i++) tx[i] = 0xff;
++    for (size_t i = prefix; i < prefix + payload_len; i++) tx[i] = 0;
++    return 0;
++}
++
++static int lisa_touch_checksum(const uint8_t *data, size_t len)
++{
++    uint32_t sum = 0;
++    if (len < 2) return 0;
++    for (size_t i = 0; i < len - 2; i++) sum += data[i];
++    return (uint16_t)sum == lisa_touch_le16(data + len - 2);
++}
++
++/* Extract the runtime event register from a complete, checksummed IC-info
++ * response. The five frequency arrays have variable counts. */
++static int lisa_touch_info_address(const uint8_t *data, size_t available, uint32_t *address)
++{
++    const size_t params_offset = 2 + 16 + 10 + 4;
++    const size_t touch_offset = 44;
++    if (!data || !address || available < 2) return -1;
++    size_t length = lisa_touch_le16(data);
++    if (length > available || length >= 1024 || length < params_offset + 5 + touch_offset + 4 + 2 ||
++        !lisa_touch_checksum(data, length)) return -1;
++    size_t offset = params_offset;
++    for (unsigned i = 0; i < 5; i++) {
++        if (offset >= length - 2) return -1;
++        size_t bytes = (size_t)data[offset++] * 2;
++        if (bytes > length - 2 - offset) return -1;
++        offset += bytes;
++    }
++    if (offset > length - 2 || touch_offset + 4 > length - 2 - offset) return -1;
++    const uint8_t *p = data + offset + touch_offset;
++    uint32_t val = (uint32_t)p[0] | (uint32_t)p[1] << 8 |
++        (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++    if (!val) return -1;
++    *address = val;
++    return 0;
++}
++
++/* Return 0 on a touch frame, 1 for another event, -1 for invalid data. */
++static int lisa_touch_decode(const uint8_t *data, size_t len, struct lisa_touch_frame *out)
++{
++    if (!data || !out || len < 8 || !lisa_touch_checksum(data, 8)) return -1;
++    if (!(data[0] & 0x80)) return 1;
++    unsigned n = data[2] & 15;
++    if (n > LISA_TOUCH_MAX || (n && (len < 8 + n * 8 + 2 ||
++        !lisa_touch_checksum(data + 8, n * 8 + 2)))) return -1;
++    struct lisa_touch_frame frame = {0};
++    unsigned ids = 0;
++    for (unsigned i = 0; i < n; i++) {
++        const uint8_t *p = data + 8 + i * 8;
++        unsigned id = p[0] >> 4, type = p[0] & 15;
++        if (type == 1 || type == 3 || id >= LISA_TOUCH_MAX || (ids & (1u << id))) return -1;
++        ids |= 1u << id;
++        frame.points[i] = (struct lisa_touch_point){ id, lisa_touch_le16(p + 2),
++            lisa_touch_le16(p + 4), lisa_touch_le16(p + 6) };
++    }
++    frame.count = (uint8_t)n;
++    *out = frame;
++    return 0;
++}
++#endif
+diff --git a/bsd/dev/lisa_geni_spi.h b/bsd/dev/lisa_geni_spi.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/lisa_geni_spi.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: APSL-2.0
++ * Lisa GENI SPI FIFO transport; no direct MMIO, clocks, pinmux or power.
++ * Caller must serialize transactions, establish ownership and provide barriers.
++ */
++#ifndef LISA_GENI_SPI_H
++#define LISA_GENI_SPI_H
++#include <stddef.h>
++#include <stdint.h>
++struct lisa_geni_spi {
++    void *context;
++    uint32_t (*read)(void *, uint32_t);
++    void (*write)(void *, uint32_t, uint32_t);
++    void (*delay_us)(void *, unsigned);
++    uint32_t fifo_depth;
++};
++int lisa_geni_spi_init(struct lisa_geni_spi *, uint32_t, uint32_t, uint32_t);
++int lisa_geni_spi_exchange(void *, const uint8_t *, uint8_t *, size_t);
++#endif
+diff --git a/bsd/dev/lisa_geni_spi.c b/bsd/dev/lisa_geni_spi.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/lisa_geni_spi.c
+@@ -0,0 +1,76 @@
++#pragma clang diagnostic ignored "-Wmissing-prototypes"
++#pragma clang diagnostic ignored "-Wsign-conversion"
++#pragma clang diagnostic ignored "-Wshorten-64-to-32"
++/* SPDX-License-Identifier: APSL-2.0
++ * Adapted from oosexgang/hackios-xnu-kernel redwood_goodix.c (APSL-2.0).
++ * FIFO mode only: clocks, power, pinmux and chip reset are caller's job.
++ */
++#include "lisa_geni_spi.h"
++#define STATUS 0x040u
++#define CLK_CFG 0x048u
++#define IF_DISABLED 0x064u
++#define FW_REV 0x068u
++#define CLK_SEL 0x07cu
++#define CMD 0x600u
++#define CMD_CTRL 0x604u
++#define IRQ_STATUS 0x610u
++#define IRQ_EN 0x614u
++#define IRQ_CLEAR 0x618u
++#define RX_FIFO 0x780u
++#define TX_FIFO 0x700u
++#define TX_STATUS 0x800u
++#define RX_STATUS 0x804u
++#define HW_PARAM 0xe24u
++#define DONE 1u
++#define ERRORS ((1u<<1)|(1u<<2)|(1u<<3)|(1u<<24)|(1u<<25)|(1u<<28)|(1u<<29))
++#define MAX_TRANSFER 1033u
++static uint32_t rd(struct lisa_geni_spi *s, uint32_t off) { return s->read(s->context, off); }
++static void wr(struct lisa_geni_spi *s, uint32_t off, uint32_t v) { s->write(s->context, off, v); }
++int lisa_geni_spi_init(struct lisa_geni_spi *s, uint32_t source_hz, uint32_t select, uint32_t spi_hz) {
++    if (!s || !s->read || !s->write || !s->delay_us || !source_hz || !spi_hz || spi_hz>6000000 || select>7) return -1;
++    if (((rd(s,FW_REV)>>8)&255)!=1 || (rd(s,IF_DISABLED)&1) || (rd(s,STATUS)&1)) return -1;
++    uint32_t depth=(rd(s,HW_PARAM)>>16)&63;
++    uint32_t div=source_hz/spi_hz+(source_hz%spi_hz!=0);
++    if (depth<4 || div==0 || div>4095) return -1;
++    s->fifo_depth=depth;
++    wr(s,0xe18,0); wr(s,IRQ_CLEAR,0xffffffffu); wr(s,0x648,0xffffffffu);
++    wr(s,0xc44,0xffffffffu); wr(s,0xd44,0xffffffffu);
++    wr(s,0x028,rd(s,0x028)|0x7f); wr(s,0xe30,rd(s,0xe30)|0xf);
++    wr(s,0x024,0x7f); wr(s,0x020,1); wr(s,0x258,rd(s,0x258)&~1u);
++    wr(s,0x810,depth-3); wr(s,0x814,depth-2); wr(s,0x80c,0);
++    wr(s,0xe1c,rd(s,0xe1c)|0xf); wr(s,IRQ_EN,rd(s,IRQ_EN)|0x7fc0007f);
++    wr(s,0x22c,0); wr(s,0x250,0); wr(s,0x224,0); wr(s,0x230,0);
++    wr(s,0x24c,0); wr(s,0x25c,rd(s,0x25c)&~2u); wr(s,0x278,0);
++    wr(s,0x260,0x0007f8fe); wr(s,0x264,0x000ffefe);
++    wr(s,0x284,0x0007f8fe); wr(s,0x288,0x000ffefe);
++    wr(s,0x254,0); wr(s,0x268,4); wr(s,CLK_SEL,select); wr(s,CLK_CFG,(div<<4)|1);
++    return 0;
++}
++int lisa_geni_spi_exchange(void *context, const uint8_t *tx, uint8_t *rx, size_t length) {
++    struct lisa_geni_spi *s=context;
++    if (!s || !s->read || !s->write || !s->delay_us || s->fifo_depth<4 || !tx || !rx || !length || length>MAX_TRANSFER || (rd(s,STATUS)&1)) return -1;
++    size_t sent=0, received=0; uint32_t irq=0;
++    wr(s,IRQ_CLEAR,0xffffffffu); wr(s,0x26c,(uint32_t)length); wr(s,0x270,(uint32_t)length); wr(s,CMD,3u<<27);
++    for (unsigned iteration=0; iteration<20000; ++iteration) {
++        while (sent<length && (rd(s,TX_STATUS)&0x0fffffffu)+1<s->fifo_depth) {
++            uint32_t word=0; for (unsigned j=0;j<4 && sent<length;++j,++sent) word|=(uint32_t)tx[sent]<<(8*j);
++            wr(s,TX_FIFO,word);
++        }
++        uint32_t status=rd(s,RX_STATUS), words=status&0x01ffffffu;
++        if (words>s->fifo_depth) break;
++        uint32_t bytes=words*4, valid=(status>>28)&7;
++        if ((status&0x80000000u) && valid && valid<4) bytes-=4-valid;
++        for (uint32_t i=0;i<words;++i) {
++            uint32_t word=rd(s,RX_FIFO);
++            for (unsigned j=0;j<4 && bytes;++j,--bytes) { if (received<length) rx[received++]=(uint8_t)(word>>(8*j)); }
++        }
++        irq=rd(s,IRQ_STATUS);
++        if (irq&ERRORS) break;
++        if ((irq&DONE) && received==length && sent==length) { wr(s,IRQ_CLEAR,irq); return 0; }
++        s->delay_us(s->context,10);
++    }
++    /* Cancel once; never keep retrying an uncertain controller. */
++    wr(s,CMD_CTRL,1u<<2);
++    for (unsigned i=0;i<2000 && !(rd(s,IRQ_STATUS)&(1u<<4));++i) s->delay_us(s->context,100);
++    return -1;
++}

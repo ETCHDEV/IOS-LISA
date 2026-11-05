@@ -1,0 +1,45 @@
+--- a/bsd/vfs/vfs_attrlist.c	2026-11-05 10:40:51
++++ b/bsd/vfs/vfs_attrlist.c	2026-11-05 10:40:51
+@@ -4365,6 +4365,7 @@
+ 		goto out;
+ 	}
+ 
++lisa_union_again:
+ 	fvdata = (struct fd_vn_data *)fp->fp_glob->fg_vn_data;
+ 	if (!fvdata) {
+ 		panic("Directory expected to have fg_vn_data");
+@@ -4462,7 +4463,34 @@
+ 		error = readdirattr(dvp, fvdata, auio, &al, options,
+ 		    &count, &eofflag, ctx);
+ 		ut->uu_flag &= ~UT_KERN_RAGE_VNODES;
++	}
++
++#if CONFIG_UNION_MOUNTS
++	/*
++	 * Lisa: as getdirentries does: at the end of a union mount's directory go on with the directory it covers. Without this
++	 * everything using this call (Foundation's enumerators, so MobileInstallation) sees only the upper layer of a union.
++	 */
++	if (!count && !error && eofflag && vnode_isvroot(dvp) && (dvp->v_mount->mnt_flag & MNT_UNION)) {
++		vnode_t uvp;
++
++		if (lookup_traverse_union(dvp, &uvp, ctx) == 0) {
++			if (vnode_isdir(uvp) && vnode_ref(uvp) == 0) {
++				if (VNOP_OPEN(uvp, fp->fp_glob->fg_flag, ctx) == 0) {
++					fp_set_data(fp, uvp);
++					VNOP_CLOSE(dvp, fp->fp_glob->fg_flag, ctx);
++					fp->fp_glob->fg_offset = 0;
++					vnode_rele(dvp);
++					vnode_put(dvp);
++					dvp = uvp;
++					FV_UNLOCK(fvdata);
++					goto lisa_union_again;
++				}
++				vnode_rele(uvp);
++			}
++			vnode_put(uvp);
++		}
+ 	}
++#endif /* CONFIG_UNION_MOUNTS */
+ 
+ 	if (count) {
+ 		fvdata->fv_offset = uio_offset(auio);

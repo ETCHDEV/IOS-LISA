@@ -1,0 +1,25 @@
+diff --git a/osfmk/kern/task_policy.c b/osfmk/kern/task_policy.c
+index c429e47..39e6461 100644
+--- a/osfmk/kern/task_policy.c
++++ b/osfmk/kern/task_policy.c
+@@ -2884,6 +2884,20 @@ task_set_cpuusage(task_t task, uint8_t percentage, uint64_t interval, uint64_t
+ 
+ 	lck_mtx_assert(&task->lock, LCK_MTX_ASSERT_OWNED);
+ 
++#if defined(BCM2837)
++	/*
++	 * The stock lsd binary disables its per-thread CPU monitor while it builds
++	 * the first LaunchServices store.  On Apple hardware AMFI supplies the
++	 * override-cpumon entitlement; the owner-signed non-Apple boot cannot carry
++	 * that entitlement through the incomplete AMFI bridge yet.  Keep this an
++	 * explicit development boot policy rather than weakening the default.
++	 */
++	uint32_t native_cpumon_override = 0;
++	if (PE_parse_boot_argn("native-cpumon-override", &native_cpumon_override,
++	    sizeof(native_cpumon_override)) && native_cpumon_override == 1)
++		cpumon_entitled = 1;
++#endif
++
+ 	/* By default, refill once per second */
+ 	if (interval == 0) {
+ 		interval = NSEC_PER_SEC;

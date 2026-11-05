@@ -1,0 +1,153 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 1fca50a..6de64f1 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1901,6 +1901,10 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region
+ #endif /* XNU_TARGET_OS_OSX */
+ 
+ #if defined(XNU_PROC_TRACE_CONSOLE) && XNU_PROC_TRACE_CONSOLE
++#if defined(__arm64__)
++extern void proc_trace_watch_springboard(task_t task);
++#endif
++
+ /*
+  * Print every exec and spawn with its result on the console. A port whose
+  * userland has no log daemon yet can follow what launchd starts.
+@@ -1918,5 +1922,14 @@ exec_trace_console(proc_t p, struct image_params *imgp, int error)
+ 	printf("proc-trace: exec pid %d ppid %d %s error %d\n",
+ 	    proc_getpid(p), proc_ppid(p), path, error);
++#if defined(__arm64__)
++	if (!error) {
++		const char *base = strrchr(path, '/');
++		base = base != NULL ? base + 1 : path;
++		if (strcmp(p->p_comm, "lsd") == 0 || strcmp(p->p_comm, "SpringBoard") == 0 ||
++		    strcmp(base, "lsd") == 0 || strcmp(base, "SpringBoard") == 0)
++			proc_trace_watch_springboard(proc_task(p));
++	}
++#endif
+ }
+ #endif
+ 
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index 801448e..ea47e51 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -139,6 +139,118 @@ extern char     *proc_name_address(struct proc *p);
+ #include <vm/vm_shared_region_internal.h>
+ #include <vm/vm_map_internal.h>
+ 
++#define PROC_TRACE_WATCH_THREADS 24
++static int proc_trace_springboard_watch_started;
++static int proc_trace_springboard_watch_chan;
++struct proc_trace_watch_thread {
++	uint64_t tid, pc, lr, fp;
++	int state;
++	char name[32];
++};
++
++static void
++proc_trace_sample_task(task_t task, unsigned pass)
++{
++	struct proc_trace_watch_thread proc_trace_watch_threads[PROC_TRACE_WATCH_THREADS];
++	unsigned count = 0, total = 0;
++	thread_t thread;
++	vm_map_t map = get_task_map(task);
++
++	if (!task_is_active(task)) {
++		printf("proc-trace: SpringBoard sample %u task inactive\n", pass);
++		return;
++	}
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		struct arm_saved_state *state;
++		char name[64];
++
++		total++;
++		if (count >= PROC_TRACE_WATCH_THREADS) continue;
++		state = get_user_regs(thread);
++		if (state == NULL || !is_saved_state64(state)) continue;
++		proc_trace_watch_threads[count].tid = thread_tid(thread);
++		proc_trace_watch_threads[count].pc = get_saved_state_pc(state);
++		proc_trace_watch_threads[count].lr = get_saved_state_lr(state);
++		proc_trace_watch_threads[count].fp = get_saved_state_fp(state);
++		proc_trace_watch_threads[count].state = thread->state;
++		name[0] = 0;
++		thread_get_thread_name(thread, name);
++		strlcpy(proc_trace_watch_threads[count].name, name,
++		    sizeof(proc_trace_watch_threads[count].name));
++		count++;
++	}
++	task_unlock(task);
++	uint64_t now_abs;
++	clock_sec_t now_sec;
++	clock_usec_t now_usec;
++	now_abs = mach_absolute_time();
++	absolutetime_to_microtime(now_abs, &now_sec, &now_usec);
++	printf("proc-trace: watch pid %d sample %u at %lu s threads %u captured %u\n", task_pid(task), pass, (unsigned long)now_sec, total, count);
++	for (unsigned i = 0; i < count; i++) {
++		char line[320];
++		uint64_t frame[2], fp = proc_trace_watch_threads[i].fp;
++		int used = snprintf(line, sizeof(line),
++		    "proc-trace:  sbthread 0x%llx st %x %s pc 0x%llx lr 0x%llx",
++		    proc_trace_watch_threads[i].tid, proc_trace_watch_threads[i].state,
++		    proc_trace_watch_threads[i].name[0] ? proc_trace_watch_threads[i].name : "-",
++		    proc_trace_watch_threads[i].pc, proc_trace_watch_threads[i].lr);
++
++		for (int depth = 0; depth < 20 && fp != 0 && (fp & 0xf) == 0 && used > 0; depth++) {
++			if (copyinmap(map, (vm_map_offset_t)fp, frame, sizeof(frame)) != KERN_SUCCESS) break;
++			if (used >= (int)sizeof(line) - 22) {
++				printf("%s\n", line);
++				used = snprintf(line, sizeof(line), "proc-trace:   ...");
++			}
++			used += snprintf(line + used, sizeof(line) - used, " 0x%llx",
++			    (unsigned long long)frame[1]);
++			if (frame[0] <= fp) break;
++			fp = frame[0];
++		}
++		printf("%s\n", line);
++	}
++}
++
++void (*proc_trace_smp_hook)(void);
++
++static void
++proc_trace_springboard_watch_thread(void *arg, __unused wait_result_t wr)
++{
++	task_t task = (task_t)arg;
++
++	{
++		extern unsigned int processor_avail_count;
++		printf("proc-trace: cpus avail %u\n", processor_avail_count);
++		if (proc_trace_smp_hook) proc_trace_smp_hook();
++	}
++	for (unsigned pass = 1; pass <= 30 && task_is_active(task); pass++) {
++		assert_wait_timeout((event_t)&proc_trace_springboard_watch_chan, THREAD_UNINT,
++		    pass == 1 ? 8000 : 40000, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		proc_trace_sample_task(task, pass);
++	}
++	task_deallocate(task);
++	thread_terminate_self();
++}
++
++void
++proc_trace_watch_springboard(task_t task)
++{
++	uint32_t enabled = 0;
++	thread_t watcher;
++
++	PE_parse_boot_argn("native-springboard-stack", &enabled, sizeof(enabled));
++	if (enabled != 1 || os_atomic_inc_orig(&proc_trace_springboard_watch_started, relaxed) >= 6) return;
++	task_reference(task);
++	if (kernel_thread_start(proc_trace_springboard_watch_thread, task, &watcher) == KERN_SUCCESS) {
++		thread_deallocate(watcher);
++		printf("proc-trace: SpringBoard kernel stack observer armed\n");
++	} else {
++		task_deallocate(task);
++		printf("proc-trace: SpringBoard kernel stack observer failed\n");
++	}
++}
++
+ /*
+  * Print the user registers, a frame-pointer backtrace and the shared cache
+  * base of a thread that raises a hardware exception. Without a crash

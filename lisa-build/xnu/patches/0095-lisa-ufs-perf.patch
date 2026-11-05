@@ -1,0 +1,51 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -110,6 +110,7 @@
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
++	bool perf;                              /* boot-arg lisa_ufs_perf=1 */
+ 	bool faulted;                           /* timed-out DMA: never reuse slot or buffers */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+@@ -156,6 +157,7 @@
+ 	if (su.faulted) {
+ 		return EIO;
+ 	}
++	uint64_t perf_start = su.perf && su.ready ? mach_absolute_time() : 0;
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
+@@ -262,6 +264,22 @@
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+ 		return EIO;
+ 	}
++	if (perf_start) {
++		static uint64_t perf_total_us, perf_max_us, perf_bytes;
++		static uint32_t perf_count;
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - perf_start, &ns);
++		uint64_t us = ns / 1000;
++		perf_total_us += us;
++		perf_max_us = MAX(perf_max_us, us);
++		perf_bytes += len;
++		if (++perf_count == 256) {
++			printf("LISA UFS PERF: 256 cmds avg %llu us max %llu us bytes %llu\n",
++			    perf_total_us / perf_count, perf_max_us, perf_bytes);
++			perf_count = 0;
++			perf_total_us = perf_max_us = perf_bytes = 0;
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -749,6 +767,9 @@
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
++	uint32_t perf = 0;
++	PE_parse_boot_argn("lisa_ufs_perf", &perf, sizeof(perf));
++	su.perf = (perf == 1);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,

@@ -1,0 +1,41 @@
+--- a/security/mac_base.c
++++ b/security/mac_base.c
+@@ -1616,6 +1616,38 @@ __mac_syscall(proc_t p, struct __mac_syscall_args *uap, int *retv __unused)
+ 	}
+ 
+ done:
++	/*
++	 * The owner iOS userspace is paired with the same-release macOS KDK
++	 * Sandbox provider on this non-Apple board.  Most platform profiles are
++	 * shared, but a few iOS-only names (first observed: com.apple.tccd) are
++	 * absent from that provider.  libsystem_sandbox treats ENOENT from the
++	 * profile-initialization operation as fatal and aborts the daemon before
++	 * SpringBoard can be brought up.
++	 *
++	 * Preserve the real Sandbox policy and every one of its access checks.
++	 * Keep successful calls handled by the real policy.  For failed calls,
++	 * match the permissive-policy behavior used by the earlier SWEET port:
++	 * operations that only establish/check policy state succeed, while calls
++	 * that must return data keep the provider's error.
++	 */
++	if (error != 0 && strcmp(target, "Sandbox") == 0) {
++		static uint64_t reported;
++		if (uap->call >= 0 && uap->call < 64 &&
++		    !(reported & (1ULL << uap->call))) {
++			reported |= 1ULL << uap->call;
++			printf("LISA Sandbox: op %d error %d\n", uap->call, error);
++		}
++		switch (uap->call) {
++		case 4:         /* container path (audit token / pid) */
++		case 5:         /* extension issue */
++		case 6:         /* extension consume */
++		case 0x43:      /* container expected */
++			break;
++		default:
++			error = 0;
++			break;
++		}
++	}
+ 	return error;
+ }
+ 

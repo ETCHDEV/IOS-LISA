@@ -1,0 +1,91 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -28,6 +28,15 @@
+ typedef int (*lisa_goodix_read_fn)(void *, uint32_t, uint8_t *, size_t);
+ typedef int (*lisa_goodix_write_fn)(void *, uint32_t, const uint8_t *, size_t);
+ int lisa_goodix_poll(void *, uint32_t, lisa_goodix_read_fn, lisa_goodix_write_fn);
++typedef int (*lisa_spi_exchange_fn)(void *, const uint8_t *, uint8_t *, size_t);
++struct lisa_goodix_spi_bus {
++	void *context;
++	lisa_spi_exchange_fn exchange;
++	uint32_t event_address;
++};
++int lisa_goodix_spi_read(void *, uint32_t, uint8_t *, size_t);
++int lisa_goodix_spi_ack(void *, uint32_t, const uint8_t *, size_t);
++int lisa_goodix_spi_discover(struct lisa_goodix_spi_bus *);
+ 
+ #define TOUCH_SE_PA      0x00a84000u
+ #define TOUCH_GCC_PA     0x00100000u
+@@ -468,8 +477,72 @@
+ 		return -1;
+ 	}
+ 	return lisa_goodix_feed(data, length);
++}
++
++/* GT9897 (Berlin-A) uses four dummy bytes; GT9916 (Berlin-D) uses three.
++ * The callback must keep chip select asserted for the complete transfer.
++ * This adapter has no hardware backend until Lisa's GENI driver is wired. */
++int
++lisa_goodix_spi_read(void *context, uint32_t address, uint8_t *out, size_t length)
++{
++	struct lisa_goodix_spi_bus *bus = context;
++	uint8_t tx[9 + 1024] = {0}, rx[9 + 1024];
++	if (!bus || !bus->exchange || !out || !length || length > 1024 ||
++	    length - 1 > UINT32_MAX - address) {
++		return -1;
++	}
++	tx[0] = 0xf1;
++	for (unsigned i = 0; i < 4; ++i) {
++		tx[1 + i] = (uint8_t)(address >> (24 - 8 * i));
++		tx[5 + i] = 0xff;
++	}
++	if (bus->exchange(bus->context, tx, rx, length + 9)) {
++		return -1;
++	}
++	memcpy(out, rx + 9, length);
++	return 0;
+ }
+ 
++/* The only permitted device write is acknowledgement of a validated event. */
++int
++lisa_goodix_spi_ack(void *context, uint32_t address, const uint8_t *data, size_t length)
++{
++	struct lisa_goodix_spi_bus *bus = context;
++	uint8_t tx[6] = {0xf0, 0, 0, 0, 0, 0}, rx[6];
++	if (!bus || !bus->exchange || !bus->event_address ||
++	    address != bus->event_address || !data || length != 1 || *data) {
++		return -1;
++	}
++	for (unsigned i = 0; i < 4; ++i) {
++		tx[1 + i] = (uint8_t)(address >> (24 - 8 * i));
++	}
++	return bus->exchange(bus->context, tx, rx, sizeof(tx)) ? -1 : 0;
++}
++
++/* Berlin-A IC-info is at 0x10068, not Berlin-D's 0x10070. A valid,
++ * checksummed table must name the event address before acknowledgements. */
++int
++lisa_goodix_spi_discover(struct lisa_goodix_spi_bus *bus)
++{
++	uint8_t info[1024];
++	uint32_t address = 0;
++	if (!bus) {
++		return -1;
++	}
++	bus->event_address = 0;
++	if (lisa_goodix_spi_read(bus, 0x10068, info, 2)) {
++		return -1;
++	}
++	size_t length = lisa_touch_le16(info);
++	if (length < 2 || length >= sizeof(info) ||
++	    lisa_goodix_spi_read(bus, 0x10068, info, length) ||
++	    lisa_goodix_event_address(info, length, &address)) {
++		return -1;
++	}
++	bus->event_address = address;
++	return 0;
++}
++
+ static int
+ touch_goodix(void)
+ {

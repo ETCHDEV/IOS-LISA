@@ -1,0 +1,19 @@
+diff --git a/bridge/NativeMetalBridge.rs b/bridge/NativeMetalBridge.rs
+index 40a753f..e365868 100644
+--- a/bridge/NativeMetalBridge.rs
++++ b/bridge/NativeMetalBridge.rs
+@@ -356,6 +356,14 @@ pub unsafe extern "C" fn nmb_selftest(loader: *const c_char, cache: *const c_cha
+     // SAFETY: plain integers and bytes.
+     *out = unsafe { std::mem::zeroed() };
+     let mut run = Run { out, mark };
++    // Lisa (2026-11-03): a panic's message and place, into the trace file the phone's test forwards
++    std::panic::set_hook(Box::new(|info| {
++        use std::io::Write;
++        let trace = std::backtrace::Backtrace::force_capture();
++        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/private/var/tmp/lisa-m2v-trace.log") {
++            let _ = writeln!(f, "failed: panic {info}\n{trace}");
++        }
++    }));
+     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| selftest(&mut run, loader, cache, qc))) {
+         Ok(code) => code,
+         Err(_) => run.fail(0x65fe, "panic"),

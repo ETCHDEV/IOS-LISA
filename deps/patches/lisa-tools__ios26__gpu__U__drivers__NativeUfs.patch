@@ -1,0 +1,48 @@
+diff --git a/NativeUfs.cpp b/NativeUfs.cpp
+index bdf3df5..ad37572 100644
+--- a/NativeUfs.cpp
++++ b/NativeUfs.cpp
+@@ -890,6 +890,17 @@ static bool hostBringUp (const char **why)
+   if (gHost.ready) {
+     return true;
+   }
++#if defined(LISA_UFS_HOST) && LISA_UFS_HOST
++  {
++    extern int lisa_ufs_host_start_c (void) __asm__ ("_lisa_ufs_host_start");
++    if (lisa_ufs_host_start_c ()) {
++      *why = "lisa ufs host";
++      return false;
++    }
++    gHost.ready = true;
++    return true;
++  }
++#endif
+   gRootDiagnostic.stage = "controller map";
+   gHost.hc = mapPhys (UFS_HC_BASE, UFS_HC_SIZE, gHost.hcMap);
+   if (!gHost.hc) {
+diff --git a/RootCommands.h b/RootCommands.h
+index 996304d..9ecc77d 100644
+--- a/RootCommands.h
++++ b/RootCommands.h
+@@ -238,8 +238,21 @@ static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)
+ }
+ 
+ // Read `blocks` (<= kDataMax / 4096) 4096-byte blocks of LUN `lun` starting at `lba` into dst.
++#if defined(LISA_UFS_HOST) && LISA_UFS_HOST
++extern "C" int lisa_ufs_host_read (uint64_t lba, uint32_t blocks, void *dst);
++#endif
++
+ static IOReturn hostRead4k (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
+ {
++#if defined(LISA_UFS_HOST) && LISA_UFS_HOST
++  // Lisa: the host and its log belong to bsd/dev/sweet_ufs.c.
++  (void) lun;
++  gRootDiagnostic.lba = lba;
++  if (!gHost.ready || !dst || !blocks || blocks > kDataMax / 4096) {
++    return kIOReturnBadArgument;
++  }
++  return lisa_ufs_host_read (lba, blocks, dst) ? kIOReturnIOError : kIOReturnSuccess;
++#endif
+   if (!gHost.ready || !dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) {
+     return kIOReturnBadArgument;
+   }

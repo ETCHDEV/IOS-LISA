@@ -1,0 +1,153 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -15,6 +15,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include "lisa_goodix_berlin.h"
++#include "lisa_geni_spi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -22,6 +23,7 @@
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
++void lisa_touch_init(void);
+ int lisa_goodix_feed(const uint8_t *data, size_t length);
+ int lisa_goodix_read_command(uint8_t *tx, size_t capacity, uint32_t address, size_t length);
+ int lisa_goodix_event_address(const uint8_t *data, size_t length, uint32_t *address);
+@@ -817,4 +819,98 @@
+ 		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
++
++/* Lisa GT9897T on QUP1 SE5 (global SE13). Kept opt-in because clocks,
++ * GPIO and RPMh are shared physical hardware, not a generic Sweet device. */
++struct lisa_touch_hw { vm_offset_t se, gcc, tlmm; struct lisa_geni_spi geni; struct lisa_goodix_spi_bus bus; };
++static struct lisa_touch_hw lisa_hw;
++static uint32_t lisa_se_read(void *p, uint32_t off) { struct lisa_touch_hw *h = p; return touch_rd(h->se, off); }
++static void lisa_se_write(void *p, uint32_t off, uint32_t v) { struct lisa_touch_hw *h = p; touch_wr(h->se, off, v); }
++static void lisa_delay(void *p, unsigned us) { (void)p; delay(us); }
++static void lisa_gpio(unsigned pin, unsigned function, unsigned pull, unsigned drive, bool output, bool high)
++{
++	uint32_t cfg = pull | function << 2 | (drive / 2 - 1) << 6 | (output ? 1u << 9 : 0);
++	if (output) touch_wr(lisa_hw.tlmm, pin * 0x1000u + 4u, high ? 2u : 0u);
++	touch_wr(lisa_hw.tlmm, pin * 0x1000u, cfg);
++}
++static uint32_t lisa_clock_rate(uint32_t cfg, uint32_t m, uint32_t inverse_n)
++{
++	static const uint32_t parent[8] = {19200000, 600000000, 0, 0, 0, 0, 300000000, 0};
++	uint64_t hz = parent[(cfg >> 8) & 7];
++	uint32_t div = cfg & 31, mode = (cfg >> 12) & 3;
++	if (div) hz = hz * 2 / (div + 1);
++	if (mode) { uint32_t n = (~inverse_n & 0xffff) + (m & 0xffff); if (!n) return 0; hz = hz * (m & 0xffff) / n; }
++	return (uint32_t)hz;
++}
++static bool lisa_touch_clocks(uint32_t *rate, uint32_t *selection)
++{
++	vm_offset_t g = lisa_hw.gcc;
++	uint32_t vote = touch_rd(g, 0x52008);
++	if (vote == UINT32_MAX) return false;
++	touch_wr(g, 0x52008, vote | (15u << 18));
++	*rate = 0; *selection = 0;
++	if (touch_rd(g, 0x18614) & 1) {
++		for (uint32_t n = 0; n < 8; ++n) {
++			uint32_t hz = lisa_clock_rate(touch_rd(g, 0x1861c + 4*n), touch_rd(g, 0x1865c + 4*n), touch_rd(g, 0x1869c + 4*n));
++			if (hz >= 4000000 && (!*rate || hz < *rate)) { *rate = hz; *selection = n; }
++		}
++	} else {
++		touch_wr(g, 0x18604, (touch_rd(g, 0x18604) & ~0x371fu) | 1u);
++		touch_wr(g, 0x18600, touch_rd(g, 0x18600) | 1u);
++		for (unsigned i = 0; i < 500 && (touch_rd(g, 0x18600) & 1); ++i) delay(10);
++		if (touch_rd(g, 0x18600) & 1) return false;
++		*rate = 19200000;
++	}
++	if (!*rate) return false;
++	touch_wr(g, 0x52008, touch_rd(g, 0x52008) | (1u << 27));
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t clocks = touch_rd(g, 0x18004) | touch_rd(g, 0x18008) | touch_rd(g, 0x185fc);
++		if (!(clocks & 0x80000000u)) return true;
++		delay(10);
++	}
++	return false;
++}
++static void lisa_touch_thread(void *arg, wait_result_t result)
++{
++	(void)arg; (void)result;
++	touch_wait(20000); /* Let display and persistent logging start first. */
++	lisa_hw.se = ml_io_map(0x00a94000u, 0x4000);
++	lisa_hw.gcc = ml_io_map(0x00100000u, 0x60000);
++	lisa_hw.tlmm = ml_io_map(0x0f100000u, 0x100000);
++	if (!lisa_hw.se || !lisa_hw.gcc || !lisa_hw.tlmm) goto out;
++	/* Assert reset while power settles; measurements from Lisa recovery. */
++	lisa_gpio(105, 0, 3, 8, true, false);
++	lisa_gpio(81, 0, 3, 8, false, false);
++	if (sweet_rpmh_vreg_enable("ldoc2", 1800)) goto out;
++	touch_wait(3);
++	if (sweet_rpmh_vreg_enable("ldoc7", 3300)) goto out;
++	touch_wait(15);
++	lisa_gpio(105, 0, 3, 8, true, true);
++	touch_wait(100);
++	uint32_t rate, selection;
++	if (!lisa_touch_clocks(&rate, &selection)) { printf("LISA TOUCH: clocks unavailable\n"); goto out; }
++	for (unsigned pin = 52; pin <= 55; ++pin) lisa_gpio(pin, 1, 0, 6, false, false);
++	lisa_hw.geni = (struct lisa_geni_spi){&lisa_hw, lisa_se_read, lisa_se_write, lisa_delay, 0};
++	if (lisa_geni_spi_init(&lisa_hw.geni, rate, selection, 1000000)) { printf("LISA TOUCH: GENI SPI unavailable\n"); goto out; }
++	lisa_hw.bus = (struct lisa_goodix_spi_bus){&lisa_hw.geni, lisa_geni_spi_exchange, 0};
++	if (lisa_goodix_spi_discover(&lisa_hw.bus)) { printf("LISA TOUCH: GT9897 IC info invalid\n"); goto out; }
++	printf("LISA TOUCH: GT9897 event register %#x\n", lisa_hw.bus.event_address);
++	for (unsigned errors = 0;;) {
++		int r = lisa_goodix_poll(&lisa_hw.bus, lisa_hw.bus.event_address, lisa_goodix_spi_read, lisa_goodix_spi_ack);
++		if (r < 0 && ++errors == 10) { touch_report(0, st.x, st.y); printf("LISA TOUCH: repeated SPI errors\n"); break; }
++		if (r >= 0) errors = 0;
++		touch_wait(10);
++	}
++out:
++	printf("LISA TOUCH: worker stopped\n");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++void lisa_touch_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (!PE_parse_boot_argn("lisatouch", &enabled, sizeof(enabled)) || enabled != 1) return;
++	if (kernel_thread_start(lisa_touch_thread, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -327,9 +327,12 @@
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/* Lisa GT9897 rails measured in recovery: L2=1800 mV, L7=3300 mV.
++	 * Keep the original Sweet L11 restriction for the inherited driver. */
++	if (!res || !((!strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400) ||
++	    (!strcmp(res, "ldoc2") && mv == 1800) ||
++	    (!strcmp(res, "ldoc7") && mv == 3300))) {
++		printf("SWEET RPMH: unsupported resource or voltage\n");
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void lisa_status_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void lisa_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -833,6 +834,7 @@
+ 	if (lisa_log == 1) sweet_log_start();
+ 	/* Opt-in Lisa PMK8350 key polling; USB and touch remain independent. */
+ 	sweet_keys_init();
++	lisa_touch_init();
+ 	return 0;
+ }
+ 

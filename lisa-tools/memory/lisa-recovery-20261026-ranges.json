@@ -1,0 +1,176 @@
+[
+  {
+    "start": "0x80894000",
+    "end_exclusive": "0x808ff000",
+    "kind": "System RAM",
+    "nested": false
+  },
+  {
+    "start": "0x83600000",
+    "end_exclusive": "0x86200000",
+    "kind": "System RAM",
+    "nested": false
+  },
+  {
+    "start": "0x8a700000",
+    "end_exclusive": "0x8ad00000",
+    "kind": "System RAM",
+    "nested": false
+  },
+  {
+    "start": "0x8b71c000",
+    "end_exclusive": "0x8b800000",
+    "kind": "System RAM",
+    "nested": false
+  },
+  {
+    "start": "0x9e500000",
+    "end_exclusive": "0xb9700000",
+    "kind": "System RAM",
+    "nested": false
+  },
+  {
+    "start": "0xa0080000",
+    "end_exclusive": "0xa21e0000",
+    "kind": "Kernel code",
+    "nested": true
+  },
+  {
+    "start": "0xa21e0000",
+    "end_exclusive": "0xa2370000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0xa2370000",
+    "end_exclusive": "0xa2856000",
+    "kind": "Kernel data",
+    "nested": true
+  },
+  {
+    "start": "0xa9000000",
+    "end_exclusive": "0xa9200000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0xae94b000",
+    "end_exclusive": "0xae9ee000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0xaeb4c000",
+    "end_exclusive": "0xaffff000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0xb96ff000",
+    "end_exclusive": "0xb9700000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0xc5100000",
+    "end_exclusive": "0xd0800000",
+    "kind": "System RAM",
+    "nested": false
+  },
+  {
+    "start": "0xd8000000",
+    "end_exclusive": "0xdf700000",
+    "kind": "System RAM",
+    "nested": false
+  },
+  {
+    "start": "0xdff00000",
+    "end_exclusive": "0x200000000",
+    "kind": "System RAM",
+    "nested": false
+  },
+  {
+    "start": "0xe1000000",
+    "end_exclusive": "0xe3400000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0xe5000000",
+    "end_exclusive": "0xffc00000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0x1f8400000",
+    "end_exclusive": "0x1f9200000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0x1f929d000",
+    "end_exclusive": "0x1f929e000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0x1f9300000",
+    "end_exclusive": "0x1ff200000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0x1ff25a000",
+    "end_exclusive": "0x1ff29b000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0x1ff29d000",
+    "end_exclusive": "0x1ff29e000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0x1ff29e000",
+    "end_exclusive": "0x1ff29f000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0x1ff29f000",
+    "end_exclusive": "0x1ff2a8000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0x1ff2a8000",
+    "end_exclusive": "0x200000000",
+    "kind": "reserved",
+    "nested": true
+  },
+  {
+    "start": "0x200000000",
+    "end_exclusive": "0x220000000",
+    "kind": "System RAM",
+    "nested": false
+  },
+  {
+    "start": "0x220000000",
+    "end_exclusive": "0x240000000",
+    "kind": "System RAM",
+    "nested": false
+  },
+  {
+    "start": "0x240000000",
+    "end_exclusive": "0x260000000",
+    "kind": "System RAM",
+    "nested": false
+  },
+  {
+    "start": "0x260000000",
+    "end_exclusive": "0x280000000",
+    "kind": "System RAM",
+    "nested": false
+  }
+]

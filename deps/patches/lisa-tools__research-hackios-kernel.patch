@@ -1,0 +1,92 @@
+diff --git a/tools/mk-ath11k.sh b/tools/mk-ath11k.sh
+index f06a33b..5a702fe 100755
+--- a/tools/mk-ath11k.sh
++++ b/tools/mk-ath11k.sh
+@@ -115,7 +115,7 @@ fi
+ 
+ # --- compile: the driver's files that are built so far, and ours
+ DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p"
+-CC="clang -target arm64-apple-ios16.5"
++CC="clang -target ${LISA_LX_TARGET:-arm64-apple-ios16.5}"
+ LD=$ROOT/xnu-deps/host/bin/ld64
+ CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fno-strict-aliasing
+ 	-funsigned-char -nostdinc -std=gnu17 -O2 -g -w
+@@ -177,8 +177,8 @@ for s in $(cat out/undefined.txt); do
+ done
+ [ -z "$missing" ] || exit 1
+ $CC -c out/stubs.s -o out/stubs.o
+-# four names are shown: where the kernel enters (lx_prepare(), lx_start(), lx_stop() and lx_transmit() of redwood_lx.h)
+-printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n' > out/exported.txt
++# The entry points and the firmware regulatory-country snapshot (redwood_lx.h).
++printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n_lx_regulatory_country\n' > out/exported.txt
+ $LD -r -arch arm64 -exported_symbols_list out/exported.txt out/all.o out/stubs.o -o out/ath11k.o 2> out/ld.err ||
+ 	{ cat out/ld.err; exit 1; }
+ rm -f out/all.o
+diff --git a/wifi/lx/src/lx_80211.c b/wifi/lx/src/lx_80211.c
+index ea753f2..f8af772 100644
+--- a/wifi/lx/src/lx_80211.c
++++ b/wifi/lx/src/lx_80211.c
+@@ -129,6 +129,17 @@ struct lx_radio {
+ };
+ 
+ static struct lx_radio *the_radio;
++/* A copied firmware attribute, not a pointer into a replaceable regdomain. */
++static unsigned reported_country;
++
++int
++lx_regulatory_country(unsigned char out[3])
++{
++	unsigned code = __atomic_load_n(&reported_country, __ATOMIC_ACQUIRE);
++	if (code == 0 || out == NULL) return 0;
++	out[0] = code & 0xff; out[1] = (code >> 8) & 0xff; out[2] = 0;
++	return 1;
++}
+ static const uint8_t no_network[ETH_ALEN];	/* the address of the network an interface has joined, while it has joined none */
+ 
+ static struct lx_radio *
+@@ -213,6 +224,7 @@ linuxkpi_ieee80211_unregister_hw(struct ieee80211_hw *hw)
+ 	}
+ 	if (the_radio == radio) {
+ 		the_radio = NULL;
++		__atomic_store_n(&reported_country, 0, __ATOMIC_RELEASE);
+ 	}
+ 	lx_os_unlock();
+ }
+@@ -325,6 +337,10 @@ linuxkpi_regulatory_set_wiphy_regd_sync(struct wiphy *wiphy, struct linuxkpi_iee
+ 		return (-ENODEV);
+ 	}
+ 	radio->applying++;
++	unsigned first = (unsigned char)copy->alpha2[0], second = (unsigned char)copy->alpha2[1];
++	bool valid = ((first >= 'A' && first <= 'Z') || (first >= '0' && first <= '9')) &&
++	    ((second >= 'A' && second <= 'Z') || (second >= '0' && second <= '9'));
++	__atomic_store_n(&reported_country, valid ? first | (second << 8) : 0, __ATOMIC_RELEASE);
+ 	lx_os_unlock();
+ 	old = radio->regd;
+ 	radio->regd = copy;
+diff --git a/wifi/lx/src/lx_bus.c b/wifi/lx/src/lx_bus.c
+index 6943a33..0b8b494 100644
+--- a/wifi/lx/src/lx_bus.c
++++ b/wifi/lx/src/lx_bus.c
+@@ -330,7 +330,9 @@ bus_looks(void *argument)
+ 			mutex_unlock(&bus.service);
+ 		}
+ 		if (!more) {
+-			lx_pause_ms(bus.irq ? 100 : 1);
++			/* Lisa's host returns 1ms awake, 10ms asleep; zero keeps upstream's default. */
++            unsigned interval = lx_os_option("wifi_poll_ms");
++            lx_pause_ms(bus.irq ? 100 : interval ? interval : 1);
+ 		}
+ 	}
+ 	bus.looks = false;
+diff --git a/xnu/files/bsd/sys/redwood_lx.h b/xnu/files/bsd/sys/redwood_lx.h
+index ef79d87..55fd159 100644
+--- a/xnu/files/bsd/sys/redwood_lx.h
++++ b/xnu/files/bsd/sys/redwood_lx.h
+@@ -100,5 +100,7 @@ void	 lx_stop(void);
+ int	 lx_transmit(const unsigned char *frame, unsigned long length);
+ /* before lx_start(), if the kernel wants it early: take the memory the radio will be shown. 0, or an errno. */
+ int	 lx_prepare(void);
++/* The firmware's currently reported country, copied atomically: 1 if known. */
++int	 lx_regulatory_country(unsigned char out[3]);
+ 
+ #endif

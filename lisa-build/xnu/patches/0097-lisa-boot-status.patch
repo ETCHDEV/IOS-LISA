@@ -1,0 +1,88 @@
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -86,3 +86,39 @@
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++/* Low-volume opt-in boot status. Counts processes, not their health. */
++extern uint64_t lisa_fb_swap_count(void);
++void lisa_status_start(void);
++struct lisa_status_counts { unsigned springboard, backboard, migration; };
++static int
++lisa_status_proc(proc_t p, void *arg)
++{
++    struct lisa_status_counts *c = arg;
++    char name[32];
++    proc_name(proc_pid(p), name, sizeof(name));
++    if (strcmp(name, "SpringBoard") == 0) c->springboard++;
++    if (strcmp(name, "backboardd") == 0) c->backboard++;
++    if (strcmp(name, "datamigrator") == 0) c->migration++;
++    return PROC_RETURNED;
++}
++static void
++lisa_status_thread(__unused void *arg, __unused wait_result_t wr)
++{
++    static int chan;
++    for (unsigned i = 0; i < 40; i++) {
++        (void)tsleep(&chan, PZERO, "lisastat", 30 * hz);
++        struct lisa_status_counts c = {0};
++        proc_iterate(PROC_ALLPROCLIST, lisa_status_proc, &c, NULL, NULL);
++        printf("LISA STATUS: SpringBoard %u backboardd %u migration %u swaps %llu\n",
++            c.springboard, c.backboard, c.migration, lisa_fb_swap_count());
++    }
++}
++void
++lisa_status_start(void)
++{
++    thread_t thread;
++    if (kernel_thread_start(lisa_status_thread, NULL, &thread) == KERN_SUCCESS) {
++        thread_deallocate(thread);
++    }
++}
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -50,6 +50,7 @@
+ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
++extern void lisa_status_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+@@ -821,6 +822,9 @@
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	uint32_t lisa_status = 0;
++	PE_parse_boot_argn("lisa_status", &lisa_status, sizeof(lisa_status));
++	if (lisa_status == 1) lisa_status_start();
+ 	/* Lisa input, USB and persistent logging need independent hardware ports. */
+ 	return 0;
+ }
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -288,6 +288,11 @@
+ 
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
++
++extern "C" uint64_t lisa_fb_swap_count(void)
++{
++	return __atomic_load_n(&sweet_fb_swap_count, __ATOMIC_RELAXED);
++}
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+@@ -303,8 +308,9 @@
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+-	if ((++sweet_fb_swap_count % 1000) == 0) {
+-		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
++	uint64_t swaps = __atomic_add_fetch(&sweet_fb_swap_count, 1, __ATOMIC_RELAXED);
++	if ((swaps % 1000) == 0) {
++		IOLog("SWEET FB: %llu swaps\n", swaps);
+ 	}
+ }
+ 

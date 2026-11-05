@@ -1,0 +1,14 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -262,9 +262,8 @@
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
+-	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	/* Lisa early bring-up: never probe Sweet PMIC/SPMI hardware. */
++	fReal = false;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {

@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Generate Lisa's Apple-format device tree (ADT) for iOS 26, from zeta's scripts/make-zeta-adt.py (none24smu/UniXNU-zeta).
+
+Lisa's GIC, timer, CPU numbering and PSCI method are the same as zeta's, and are checked against ios-sweet/dtb/lisa-live.dtb.
+Root compatible and /product model are Lisa's; the identity is the target IPSW's: iPhone18,2 (V54), iOS 26.5.2 23F84.
+DRAM: 0x80000000..0x280000000 holds every System RAM range in the phone's /proc/iomem.
+"""
+import argparse
+import hashlib
+import os
+import struct
+import subprocess
+import zlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+DTB = ROOT.parent / 'ios-sweet/dtb/lisa-live.dtb'
+
+DRAM_BASE = 0x80000000
+DRAM_SIZE = 0x200000000          # 0x80000000..0x280000000, see above
+ARMIO_BASE = 0x17000000          # APSS block containing the GIC
+ARMIO_SIZE = 0x08000000
+GIC_DIST = 0x17a00000
+GIC_DIST_SIZE = 0x10000
+GIC_REDIST = 0x17a60000
+GIC_REDIST_SIZE = 0x100000
+GIC_REDIST_STRIDE = 0x20000
+TIMEBASE = 19200000
+CPU_REGS = (0x000, 0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700)
+
+# Lisa's own strings: the live device tree's.
+BOARD_COMPATIBLE = b'qcom,yupik-idp\0qcom,yupik\0qcom,idp\0'
+BOARD_MODEL = b'Xiaomi 11 Lite 5G NE\0'
+CPU_COMPATIBLE = b'qcom,kryo\0'
+# xnu-12377 prng_random.c requests 4 * SHA512_DIGEST_LENGTH bytes on ARM64.
+# A shorter seed is fatal on the first early_random() call in arm_vm_init.
+BOOTLOADER_ENTROPY_BYTES = 256
+
+# iPhone18,2 identity, from DeviceTree.v54ap.im4p of 23F84.
+MODEL = b'iPhone18,2\0'
+TARGET_TYPE = b'V54\0'
+PRODUCT = [
+    ('product-name', b'iPhone 17 Pro Max\0'),
+    ('product-description', b'iPhone 17 Pro Max\0'),
+    ('artwork-device-idiom', b'phone\0'),
+    ('artwork-device-subtype', struct.pack('<I', 2340)),
+    ('artwork-scale-factor', struct.pack('<I', 3)),
+    ('artwork-display-gamut', b'P3\0'),
+    ('artwork-dynamic-displaymode', b'0\0'),
+    ('compatible-device-fallback', b'iPhone17,2\0'),
+    ('sub-product-type', b'iPhone18,2\0'),
+    ('thin-bezel', struct.pack('<I', 1)),
+    ('oled-display', struct.pack('<I', 1)),
+    ('partition-style', b'iOS\0'),
+    ('app-macho-architecture', b'arm64e\0'),
+]
+# Apple's names are volup|voldown|hold|ringeren; zeta has no ring/action switch.
+BUTTON_NAMES = b'volup\0voldown\0hold\0'
+# The stock V54AP tree's /buttons home-button-type: 2 is no Home button (Face ID, swipe-up home gesture). MobileGestalt
+# reads it; absent, iOS treats the phone as a Home-button model ("Press Home to open").
+HOME_BUTTON_TYPE = 2
+# The stock vendor image's GPU firmware as GpuPowerProbe pins it: a660_gmu.bin (55256 bytes, ZetaGmu.c), a660_sqe.fw and
+# a660_zap.elf (the zap .mdt with its .b00-.b02 segments at their file offsets).
+GPU_FIRMWARE = {'zeta-gpu-gmu': ('a660_gmu.bin', '6bb9360a1601253a86ee3ae1b9b916f5f1832a72d55e9b8573567f1740c94e2b'),
+                'zeta-gpu-sqe': ('a660_sqe.fw', 'f911a4badf7b56719cb130492bc39f9edb85335f54e8b4983b5c67eb9e6204bb'),
+                'zeta-gpu-zap': ('a660_zap.elf', '252e8246a8241af81d88174921e6f7df1a94a66789e72b3592a2cbd8b3fc72e4')}
+
+
+def node(name, properties=(), children=()):
+    properties = [('name', name.encode() + b'\0'), *properties]
+    result = struct.pack('<II', len(properties), len(children))
+    for key, data in properties:
+        result += struct.pack('<32sI', key.encode(), len(data))
+        result += data + bytes(-len(data) % 4)
+    return result + b''.join(children)
+
+
+def local_mac(seed, radio):
+    """A stable locally administered unicast MAC (bit 1 set, bit 0 clear) for one radio of this board."""
+    digest = bytearray(hashlib.sha256(b'lisa ' + radio.encode() + struct.pack('<Q', seed)).digest()[:6])
+    digest[0] = (digest[0] & 0xfc) | 0x02
+    return bytes(digest)
+
+
+def empty_nvram_proxy():
+    """A fresh volatile CHRP bank for upstream IODTNVRAM, with no controller."""
+    def header(name, size):
+        raw = bytearray(struct.pack('<BBH12s', 0x70, 0, size // 16, name))
+        checksum = sum(raw)
+        while checksum > 255:
+            checksum = (checksum & 255) + (checksum >> 8)
+        raw[1] = checksum
+        return raw
+
+    image = bytearray(8192)
+    image[:16] = header(b'nvram', 32)
+    image[32:48] = header(b'common', 16 + 2048)
+    free_at = 32 + 16 + 2048
+    image[free_at:free_at + 16] = header(b'free', len(image) - free_at)
+    struct.pack_into('<I', image, 16, zlib.adler32(image[20:]))
+    return [('nvram-bank-size', struct.pack('<I', len(image))),
+            ('nvram-bank-count', struct.pack('<I', 1)),
+            ('nvram-current-bank', struct.pack('<I', 0)),
+            ('nvram-proxy-data', bytes(image))]
+
+
+def filesystems(blocks, template='/private/var/'):
+    """/filesystems in the stock tree's format, with one ephemeral Data entry.
+
+    The entry copies the iPhone18,2 tree's ephemeral-diag-data-vol except for the size and, when given,
+    the template directory that mount(8) copies into the new tmpfs. No os_env_type:
+    mount(8) then does not require a Data role volume in the boot container. The kernel publishes the
+    entries as vfs.generic.apfs.edt_fstab (UniXNU XNU_EDT_FSTAB)."""
+    u32 = lambda value: struct.pack('<I', value)
+    data = node('ephemeral-data-vol', [
+        ('vol.fs_file', b'/private/var\0'),
+        ('vol.fs_type', b'rw\0'),
+        ('vol.fs_mntopts', b'nosuid,nodev,size=%d,template=%s\0' % (blocks, template.encode())),
+        ('vol.fs_name', b'Data\0'),
+        ('vol.fs_ephemeral', b''),
+        ('vol.fs_passno', u32(2)),
+        ('vol.fs_mntorder', u32(0))])
+    return node('filesystems', [('e-apfs', u32(1))], [node('fstab', [('max_fs_entries', u32(1))], [data])])
+
+
+def check_board_tree():
+    """Compare the constants with the stock tree when it is there (scripts/make-zeta-dtb.py builds it)."""
+    if not DTB.is_file():
+        raise SystemExit(f'{DTB}: missing')
+    def get(path, prop):
+        result = subprocess.run(['fdtget', '-t', 'x', str(DTB), path, prop], capture_output=True, text=True)
+        return [int(word, 16) for word in result.stdout.split()]
+    gic = '/soc/interrupt-controller@17a00000'
+    expected = {
+        (gic, 'reg'): [GIC_DIST, GIC_DIST_SIZE, GIC_REDIST, GIC_REDIST_SIZE],
+        (gic, 'redistributor-stride'): [0, GIC_REDIST_STRIDE],
+        ('/soc/timer', 'clock-frequency'): [TIMEBASE],
+        **{(f'/cpus/cpu@{reg:x}', 'reg'): [0, reg] for reg in CPU_REGS},
+    }
+    for (path, prop), value in expected.items():
+        if get(path, prop) != value:
+            raise SystemExit(f'{DTB.name}: {path} {prop} is not {[hex(v) for v in value]}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, default=ROOT / 'ios26/lisa/out/lisa.adt')
+    parser.add_argument('--dram-size', type=lambda value: int(value, 0), required=True,
+                        help=f'board.toml [payload] dram_size; must be {DRAM_SIZE:#x}')
+    parser.add_argument('--owned-memory-size', type=lambda value: int(value, 0), default=None,
+                        help='Explicit DarwinBoot contiguous window request, 256 MiB..8 GiB in 2 MiB steps')
+    parser.add_argument('--root-match-volume-uuid', default=None,
+                        help='/chosen/root-matching: select the root by the UUID of an IOMedia')
+    parser.add_argument('--unique-chip-id', type=lambda value: int(value, 16), default=None,
+                        help='/chosen/unique-chip-id (8 bytes) and --chip-id (4 bytes) seed XNU IOPlatformUUID; software seeds')
+    parser.add_argument('--chip-id', type=lambda value: int(value, 16), default=None)
+    parser.add_argument('--cpu-regs', default=','.join(hex(reg) for reg in CPU_REGS),
+                        help='Comma-separated /cpus reg values (MPIDR Affinity1 numbering), boot CPU 0 first; '
+                             'zeta has the eight of the stock tree. More than one adds /psci')
+    parser.add_argument('--psci-method', choices=['smc', 'hvc'], default='smc', help='/psci method (stock tree: smc)')
+    parser.add_argument('--packed-data-ramdisk', action='store_true',
+                        help='PackedRAMDisk placeholder: DarwinBoot hands validated DBRDISK1 extents to the sparse block driver')
+    parser.add_argument('--data-ramdisk', action='store_true', help='RAMDisk placeholder for a dense scratch Data seed')
+    parser.add_argument('--persistent-data', action='store_true',
+                        help='The Data disk keeps its writes across boots: no ephemeral-storage')
+    parser.add_argument('--trust-cache', action='store_true', help='TrustCache placeholder')
+    parser.add_argument('--ephemeral-data-blocks', type=int, default=None,
+                        help='/filesystems/fstab with one ephemeral Data entry: mount(8) builds /private/var as a '
+                             'tmpfs of this many 512-byte blocks from the root volume\'s /private/var')
+    parser.add_argument('--ephemeral-data-template', default='/private/var/',
+                        help='directory on the root volume copied into the ephemeral Data tmpfs (default /private/var/; '
+                             'its staged_system_apps alone is 1.1 GB)')
+    parser.add_argument('--csr-config', type=lambda value: int(value, 0), default=None,
+                        help='/chosen/asmb lp-sip0: the CSR flags of a kernel built with XNU_APFS_CSR (lp-sip1 stays 0). '
+                             'Without it csr_config is 0, full SIP')
+    parser.add_argument('--gpu-firmware', type=Path, default=None,
+                        help='a directory with the stock vendor image\'s a660_gmu.bin, a660_sqe.fw and a660_zap.elf: /chosen '
+                             'zeta-gpu-gmu, -sqe and -zap for GpuPowerProbe modes 7 and 9. Proprietary; local builds only, never CI')
+    parser.add_argument('--text-fixup', action='append', default=[],
+                        help='/chosen/text-fixups entry <file name>,<hex file offset>,<hex original>,<hex replacement> (repeatable, '
+                             'at most 32): signed text the kernel changes after page validation, as text-fixup0..7 without '
+                             'the boot-argument space')
+    parser.add_argument('--ipad-identity', action='store_true', help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.ipad_identity:
+        parser.error('zeta targets iPhone18,2; remove ipad_identity from board.toml [payload.adt]')
+    if args.ephemeral_data_blocks is not None and not 0 < args.ephemeral_data_blocks < 1 << 32:
+        parser.error('--ephemeral-data-blocks must be a positive 32-bit block count')
+    if not (args.ephemeral_data_template.startswith('/') and args.ephemeral_data_template.endswith('/')
+            and ',' not in args.ephemeral_data_template):
+        parser.error('--ephemeral-data-template must be an absolute directory path ending in / without commas')
+    if args.dram_size != DRAM_SIZE:
+        parser.error(f'--dram-size must be {DRAM_SIZE:#x}, the DRAM range measured on the phone')
+    if args.csr_config is not None and not 0 <= args.csr_config < 1 << 32:
+        parser.error('--csr-config must fit 32 bits')
+    if (args.unique_chip_id is None) != (args.chip_id is None):
+        parser.error('--unique-chip-id and --chip-id must be supplied together')
+    if args.unique_chip_id is not None and not (0 < args.unique_chip_id < 1 << 64 and 0 < args.chip_id < 1 << 32):
+        parser.error('--unique-chip-id must fit 8 bytes and --chip-id 4 bytes, both nonzero')
+    if args.owned_memory_size is not None and (
+            not 0x10000000 <= args.owned_memory_size <= 0x200000000 or args.owned_memory_size % 0x200000):
+        parser.error('Owned memory must be 256 MiB to 8 GiB, aligned to 2 MiB')
+    try:
+        cpu_regs = [int(value, 0) for value in args.cpu_regs.split(',')]
+    except ValueError:
+        parser.error('--cpu-regs must be integers')
+    if not cpu_regs or cpu_regs[0] != 0 or len(set(cpu_regs)) != len(cpu_regs) or not set(cpu_regs) <= set(CPU_REGS):
+        parser.error(f'--cpu-regs: distinct values from {",".join(hex(reg) for reg in CPU_REGS)}, boot CPU 0 first')
+    if len(args.text_fixup) > 32 or any(len(f) >= 160 or f.count(',') != 3 for f in args.text_fixup):
+        parser.error('--text-fixup: at most 32 entries of 4 comma-separated fields, each under 160 characters')
+    check_board_tree()
+
+    cpus = [node('cpu%d' % index, [('state', b'running\0' if index == 0 else b'waiting\0'),
+                                   ('reg', struct.pack('<I', reg)),
+                                   ('device_type', b'cpu\0'), ('compatible', CPU_COMPATIBLE),
+                                   ('timebase-frequency', struct.pack('<I', TIMEBASE))])
+            for index, reg in enumerate(cpu_regs)]
+    ramdisk = args.data_ramdisk or args.packed_data_ramdisk
+    gpu_firmware = []
+    for key, (name, digest) in GPU_FIRMWARE.items() if args.gpu_firmware else ():
+        data = (args.gpu_firmware / name).read_bytes()
+        if hashlib.sha256(data).hexdigest() != digest:
+            parser.error(name + ' is not the stock Surface Duo 2 firmware')
+        gpu_firmware.append((key, data))
+    tree = node('device-tree', [
+        # hw.product/hw.machine/hw.target come from the root model/target-type (IODTPlatformExpert).
+        ('model', MODEL),
+        ('target-type', TARGET_TYPE),
+        ('compatible', BOARD_COMPATIBLE),
+        ('#address-cells', struct.pack('<I', 2)),
+        ('#size-cells', struct.pack('<I', 2)),
+    ], [
+        node('chosen', [('random-seed', os.urandom(BOOTLOADER_ENTROPY_BYTES)),
+                        # Without these XNU never publishes IOPlatformUUID and gethostuuid() blocks forever.
+                        *([('unique-chip-id', struct.pack('<Q', args.unique_chip_id)), ('chip-id', struct.pack('<I', args.chip_id))]
+                          if args.unique_chip_id is not None else []),
+                        # MobileGestalt's Wi-Fi address reads /chosen/mac-address-wifi0 and, without it and without an sdio, wlan or
+                        # marconi-wifi node, waits 5 s for an IONetworkController per question; lsd asks per app at first boot. zeta
+                        # has no Wi-Fi driver, so both addresses are locally administered unicast ones derived from the platform seed.
+                        *([(f'mac-address-{radio}', local_mac(args.unique_chip_id, radio)) for radio in ('wifi0', 'bluetooth0')]
+                          if args.unique_chip_id is not None else []),
+                        ('osenvironment', b'main\0'),
+                        ('embedded-panic-log-size', struct.pack('<I', 0x10000)),
+                        # Read by the kernel's text fixups (native-text-fixup.patch) before the text-fixup0..7 boot arguments.
+                        *([('text-fixups', b''.join(f.encode() + b'\0' for f in args.text_fixup))] if args.text_fixup else []),
+                        # Bootloader contract read by ml_unsafe_kernel_text_init.
+                        # This non-Apple platform does not enable Apple CTRR.
+                        ('kernel-ctrr-to-be-enabled', struct.pack('<I', 0)),
+                        # Security status of a dev-fused, undemoted board (0,0,1,1), as sheng sets for its identity.
+                        ('certificate-production-status', struct.pack('<I', 0)),
+                        ('effective-production-status-ap', struct.pack('<I', 0)),
+                        ('certificate-security-mode', struct.pack('<I', 1)),
+                        ('effective-security-mode-sep', struct.pack('<I', 1)),
+                        *([('ephemeral-storage', struct.pack('<I', 1))] if ramdisk and not args.persistent_data else []),
+                        *([('darwinboot-memory-size', struct.pack('<Q', args.owned_memory_size))] if args.owned_memory_size else []),
+                        ('dram-base', struct.pack('<Q', DRAM_BASE)),
+                        ('dram-size', struct.pack('<Q', args.dram_size)),
+                        # The iPhone18,2 tree selects sha2-384 in /chosen; it names the algorithm only.
+                        ('crypto-hash-method', b'sha2-384\0'),
+                        *([('root-matching', ('<dict><key>IOProviderClass</key><string>IOMedia</string>'
+                                              '<key>IOPropertyMatch</key><dict><key>UUID</key><string>' +
+                                              args.root_match_volume_uuid.upper() + '</string></dict></dict>\0').encode())]
+                          if args.root_match_volume_uuid else []),
+                        # Original AMFI, platform code only: enforcing, not relaxed.
+                        ('amfi-only-platform-code', struct.pack('<I', 1)),
+                        *gpu_firmware,
+                        *empty_nvram_proxy()],
+             [node('memory-map', ([('PackedRAMDisk' if args.packed_data_ramdisk else 'RAMDisk', bytes(16))] if ramdisk else []) +
+                                 ([('TrustCache', bytes(16))] if args.trust_cache else []) +
+                                 []),
+              # Read by the original AppleImage4 at start-up; present and empty here.
+              node('manifest-properties'),
+              # The local boot policy's SIP words. iOS kernels have no CSR; XNU_APFS_CSR turns config_csr on
+              # for the KDK APFS kext, so csr_bootstrap reads them.
+              *([node('asmb', [('lp-sip0', struct.pack('<Q', args.csr_config)), ('lp-sip1', struct.pack('<I', 0))])]
+                if args.csr_config is not None else [])]),
+        *([filesystems(args.ephemeral_data_blocks, args.ephemeral_data_template)]
+          if args.ephemeral_data_blocks is not None else []),
+        # Lisa's kprintf console (patches/xnu-12377/zzz-lisa-fbcon.patch): ABL's splash framebuffer.
+        node('sweet-fbcon', [('reg', struct.pack('<QQ', 0xe1000000, 0x2300000)), ('width', struct.pack('<I', 1080)),
+                             ('height', struct.pack('<I', 2400)), ('stride', struct.pack('<I', 4320))]),
+        # The panic log region XNU_DT_PANIC_REGION wants: the second half of the phone's ramoops area. Without it a panic faults in SavePanicInfo and never resets.
+        node('pram', [('reg', struct.pack('<QQ', 0xa9100000, 0x100000))]),
+        # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
+        node('sweet-ufs', [('reg', struct.pack('<QQ', 0x01d84000, 0x3000))]),
+        node('cpus', children=cpus),
+        *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', args.psci_method.encode() + b'\0')])] if len(cpus) > 1 else []),
+        # Suspend/resume is not implemented: keep the CPU from parking forever.
+        # kern.maxvnodes, as sheng sets it.  The Lisa machine configuration uses
+        # the normal medium CONFIG_VNODES ceiling so this memory-sized request is
+        # not clipped to xsmall's 1024 entries while lsd indexes system apps.
+        node('defaults', [('sleep-disabled', struct.pack('<I', 1)),
+                          ('kern.maxvnodes', struct.pack('<I', args.dram_size // 65536 + 1024))]),
+        node('options', []),
+        node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'), ('button-names', BUTTON_NAMES),
+                         ('home-button-type', struct.pack('<I', HOME_BUTTON_TYPE))]),
+        # The original AppleImage4 panics without a product node.
+        node('product', [*PRODUCT, ('model', BOARD_MODEL)]),
+        node('arm-io', [('device_type', b'arm-io\0'),
+                        ('#address-cells', struct.pack('<I', 2)),
+                        ('#size-cells', struct.pack('<I', 2)),
+                        ('ranges', struct.pack('<QQQ', 0, ARMIO_BASE, ARMIO_SIZE))],
+             [node('intc', [('compatible', b'arm,gic-v3\0'),
+                            ('reg', struct.pack('<4Q', GIC_DIST - ARMIO_BASE, GIC_DIST_SIZE,
+                                                GIC_REDIST - ARMIO_BASE, GIC_REDIST_SIZE)),
+                            ('redistributor-stride', struct.pack('<Q', GIC_REDIST_STRIDE))])]),
+    ])
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_bytes(tree)
+    print(f'lisa ADT: {len(tree)} bytes, {len(cpus)} CPUs, dram {DRAM_BASE:#x}+{args.dram_size:#x}, timebase {TIMEBASE}')
+
+
+if __name__ == '__main__':
+    main()

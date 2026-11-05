@@ -1,0 +1,58 @@
+diff --git a/NativeRamBlock.cpp b/NativeRamBlock.cpp
+index 90d8e71..7369e00 100644
+--- a/NativeRamBlock.cpp
++++ b/NativeRamBlock.cpp
+@@ -185,6 +185,7 @@ OSDefineMetaClassAndStructors(NativeRamBlock, IOBlockStorageDevice)
+ 
+ bool NativeRamBlock::start(IOService *provider)
+ {
++  IOLog("NativeRamBlock: start\n");
+   if (!IOBlockStorageDevice::start(provider)) return false;
+   IORegistryEntry *map = IORegistryEntry::fromPath("/chosen/memory-map", gIODTPlane);
+   if (!map) return false;
+@@ -192,6 +193,7 @@ bool NativeRamBlock::start(IOService *provider)
+   OSData *range = OSDynamicCast(OSData, map->getProperty("RAMDisk"));
+   if(packed && range){map->release();return false;}
+   if(packed)range=packed;
++  IOLog("NativeRamBlock: packed %d range %d\n",packed!=nullptr,range!=nullptr);
+   bool packedInput=packed!=nullptr;
+   uint64_t physical = 0, bytes = 0;
+   if (range && range->getLength() == 16) {
+@@ -199,6 +201,7 @@ bool NativeRamBlock::start(IOService *provider)
+     memcpy(&bytes, static_cast<const uint8_t *>(range->getBytesNoCopy()) + 8, 8);
+   }
+   map->release();
++  IOLog("NativeRamBlock: seed at %#llx, %llu bytes (RAM %#lx + %#lx)\n",physical,bytes,gPhysBase,gPhysSize);
+   // Boot memory belongs to the loader/kernel; never allocate or free it here.
+   if (!bytes || bytes > 0x80000000 || (physical & 4095) || (!packedInput && (bytes & 4095)) ||
+       physical < gPhysBase || bytes > gPhysSize || physical - gPhysBase > gPhysSize - bytes) return false;
+@@ -206,7 +209,7 @@ bool NativeRamBlock::start(IOService *provider)
+   if (!memory || !(gate = IOLockAlloc())) return false;
+   uint64_t logical=bytes;
+   if(packedInput){
+-    if(!ramPackedLayout(memory,bytes,&logical))return false;
++    if(!ramPackedLayout(memory,bytes,&logical)){IOLog("NativeRamBlock: bad packed layout\n");return false;}
+     struct ImportOps {uint8_t *allocate(){return static_cast<uint8_t *>(IOMallocZero(4096));}} ops;
+     if(logical>0x80000000ULL){
+       uint64_t nonzero=0;
+@@ -244,6 +247,7 @@ bool NativeRamBlock::start(IOService *provider)
+   online = true;
+   native_ram_block_ready = 1;
+   registerService();
++  IOLog("NativeRamBlock: published %llu bytes\n",logical);
+   return true;
+ }
+ 
+@@ -428,5 +432,11 @@ extern "C" int native_ram_block_volume_seed(const char *uuid,dev_t *device,char
+     uint64_t *base,uint64_t *bytes,uint8_t digest[32]) {
+   if(!base || !bytes || !digest)return 0;
+   *base=0;*bytes=0;memset(digest,0,32);
+-  return selectVolumeSeed(uuid,device,path,size,base,bytes,digest);
++  // Lisa: APFS publishes the volume asynchronously after the disk: wait for it rather than failing the boot on a race.
++  for(unsigned tick=0;tick<150;++tick){
++    if(selectVolumeSeed(uuid,device,path,size,base,bytes,digest)){IOLog("NativeRamBlock: Data volume %s found after %u ms\n",path,tick*100);return 1;}
++    IOSleep(100);
++  }
++  IOLog("NativeRamBlock: no Data volume %s after 15 s\n",uuid);
++  return 0;
+ }

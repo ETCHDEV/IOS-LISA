@@ -1,0 +1,10 @@
+0x100000000..0x1f8400000  3972.0 MiB
+0x200000000..0x280000000  2048.0 MiB
+
+XNU status:
+- Verified temporary XNU range: 0x180000000..0x1f0000000 (1792 MiB).
+- Do not enlarge this contiguous range across the reservation beginning at
+  0x1f8400000. The 0x200000000..0x280000000 bank is discontiguous.
+- Using that bank requires an explicit multi-range boot-argument and pmap/vm
+  page-list implementation; arm_vm_init currently derives all physical pages
+  from one gPhysBase + memSize interval.

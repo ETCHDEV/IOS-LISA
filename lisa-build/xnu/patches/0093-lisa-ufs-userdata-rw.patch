@@ -1,0 +1,46 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -485,13 +485,19 @@
+ {
+ 	int error = 0;
+ 	caddr_t vaddr = NULL;
+-	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
++	uint64_t off = 0;
+ 	uint32_t count = buf_count(bp);
+ 	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
+ 
+ 	bool rd = buf_flags(bp) & B_READ;
+ 
+ 	buf_setresid(bp, count);
++	if (buf_blkno(bp) < 0 || (uint64_t)buf_blkno(bp) > UINT64_MAX / su.secsize ||
++	    su.nblocks > UINT64_MAX / UFS_BLOCK) {
++		error = EINVAL;
++		goto done;
++	}
++	off = (uint64_t)buf_blkno(bp) * su.secsize;
+ 	if (!rd && !su.writable) {
+ 		error = EROFS;
+ 		goto done;
+@@ -713,7 +719,7 @@
+ 	char want[64] = "userdata";
+ 	int error;
+ 
+-	/* Experimental opt-in, read-only. Keep the default fully disabled. */
++	/* Experimental opt-in. Keep the default fully disabled. */
+ 	uint32_t lisa_probe = 0;
+ 	PE_parse_boot_argn("lisa_ufs_probe", &lisa_probe, sizeof(lisa_probe));
+ 	if (lisa_probe != 1) return ENXIO;
+@@ -732,7 +738,12 @@
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+-	if (rw) return EROFS; /* No hardware writes to storage in this probe. */
++	uint32_t lisa_write = 0;
++	PE_parse_boot_argn("lisa_ufs_write", &lisa_write, sizeof(lisa_write));
++	if (rw && (rw != 1 || lisa_write != 1 || strcmp(want, "userdata") != 0)) {
++		printf("LISA UFS: writable access requires explicit userdata opt-in\n");
++		return EROFS;
++	}
+ 	uint32_t cache = 0, wait = 0;
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));

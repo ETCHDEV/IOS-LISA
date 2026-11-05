@@ -1,0 +1,174 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -31,6 +31,11 @@
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <sys/param.h>
++#include <kern/task.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
+ #include <sys/systm.h>
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+@@ -280,13 +285,100 @@
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+  * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
++ * data (extension tokens) fail with ENOENT. Container paths come from
++ * the target process's exec environment. The first
+  * use of each operation number is logged.
+  */
++/* HackiOS kern_minimac.c: PlugInKit needs a real container path, supplied
++ * by RunningBoard/pkd as CFFIXED_USER_HOME. Read the target's saved exec
++ * environment rather than inventing a common container for all extensions. */
++#define SWEET_CONTAINER_VARIABLE "CFFIXED_USER_HOME="
++static int
++sweet_sandbox_container_path(user_addr_t arg)
++{
++	struct {
++		int64_t     pid;
++		uint64_t    pidversion;
++		user_addr_t buffer;
++		user_size_t size;
++		uint64_t    check_pidversion;
++	} args;
++	const size_t prefix_len = sizeof(SWEET_CONTAINER_VARIABLE) - 1;
++	proc_t p;
++	task_t task;
++	vm_map_t map;
++	vm_map_copy_t copy = NULL;
++	vm_offset_t strings = 0;
++	vm_size_t strings_size;
++	user_addr_t user_stack;
++	size_t argslen, len;
++	const char *s, *end;
++	int error;
++
++	error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	p = proc_find((int)args.pid);
++	if (p == PROC_NULL) {
++		return ESRCH;
++	}
++	if (args.check_pidversion && (uint64_t)proc_pidversion(p) != args.pidversion) {
++		proc_rele(p);
++		return ESRCH;
++	}
++	user_stack = p->user_stack;
++	argslen = p->p_argslen;
++	task = proc_task(p);
++	if (user_stack == 0 || argslen == 0 || argslen > ARG_MAX || task == TASK_NULL) {
++		proc_rele(p);
++		return 0;
++	}
++	/* the same way as sysctl_procargsx(): the task keeps the map alive once the process is let go */
++	task_reference(task);
++	proc_rele(p);
++	map = get_task_map_reference(task);
++	task_deallocate(task);
++	if (map == VM_MAP_NULL) {
++		return 0;
++	}
++	strings_size = vm_map_round_page(argslen, vm_map_page_mask(map));
++	if (kmem_alloc(kernel_map, &strings, strings_size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		vm_map_deallocate(map);
++		return ENOMEM;
++	}
++	if (vm_map_copyin(map, (vm_map_address_t)(user_stack - strings_size), strings_size, FALSE, &copy) != KERN_SUCCESS) {
++		copy = NULL;
++	}
++	vm_map_deallocate(map);
++	if (copy == NULL || vm_map_copy_overwrite(kernel_map, strings, copy, strings_size, FALSE) != KERN_SUCCESS) {
++		if (copy != NULL) {
++			vm_map_copy_discard(copy);
++		}
++		kmem_free(kernel_map, strings, strings_size);
++		return 0;                       /* the process is on its way out, or has unmapped its own stack */
++	}
++
++	error = ENOENT;
++	end = (const char *)(strings + strings_size);
++	for (s = end - argslen; s < end; s += len + 1) {
++		len = strnlen(s, end - s);
++		if (len > prefix_len && s + len < end && strncmp(s, SWEET_CONTAINER_VARIABLE, prefix_len) == 0) {
++			s += prefix_len;
++			len -= prefix_len;
++			error = len < args.size ? copyout(s, args.buffer, len + 1) : ENAMETOOLONG;
++			break;
++		}
++	}
++	kmem_free(kernel_map, strings, strings_size);
++	return error;
++}
++
++
+ static uint64_t sweet_sandbox_seen;
+ 
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -296,6 +388,7 @@
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
++		return sweet_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
+ 	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */
+@@ -305,8 +398,39 @@
+ 	}
+ }
+ 
++/* libamfi calls the policy named "AMFI", not the human-readable policy
++ * description. Without this ABI dyld disables @rpath expansion and inserted
++ * libraries, even for our validated system apps with embedded frameworks.
++ * Match HackiOS kern_minimac.c's experimental-port policy. Signature/page
++ * validation above remains unchanged. */
++static int
++sweet_amfi_policy_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input_flags;
++		user_addr_t output_flags;
++	} args;
++	uint64_t value;
++	int error;
++
++	if (call == 0x60) { /* ExtensionKit: this port has no AMFI verification service. */
++		value = 0x86;
++		return copyout(&value, arg, sizeof(value));
++	}
++	if (call != 0x5a) {
++		return ENOPOLICY;
++	}
++	error = copyin(arg, &args, sizeof(args));
++	if (error != 0) {
++		return error;
++	}
++	value = 0xff; /* dyld @paths, environment, interposition in this research OS */
++	return copyout(&value, args.output_flags, sizeof(value));
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_policy_syscall,
+ };
+ 
+ /*
+@@ -360,7 +484,7 @@
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };

@@ -1,0 +1,1763 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 60d8aa6..ee410f2 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -104,6 +104,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/mem.c				standard
++bsd/dev/sweet_ufs.c			standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+ 
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+new file mode 100644
+index 0000000..f8da8ff
+--- /dev/null
++++ b/bsd/dev/sweet_ufs.c
+@@ -0,0 +1,1127 @@
++/*
++ * SWEET internal UFS root device.
++ *
++ * The Qualcomm UFS host (UFSHCI 2.1) is left enabled with the link up by the
++ * bootloader, which loaded our boot image from it. This driver reuses that
++ * state: it points the transfer request list at its own memory (verifying the
++ * host took it before ringing any doorbell) and issues polled SCSI commands,
++ * one at a time, to LUN 0. It finds one GPT partition by name (boot-arg
++ * ufsroot=, default "userdata") and exposes it as the BSD disk ufsroot0
++ * (rufsroot0), with 512-byte logical sectors over the device's 4 KiB blocks.
++ * Root on it with rd=ufsroot0.
++ *
++ * All DMA goes through one physically contiguous allocation (descriptors and
++ * a 1 MiB bounce buffer); the host is not cache coherent, so caches are
++ * cleaned/invalidated around each command.
++ *
++ * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
++ * against the partition bounds again right before it is issued, so nothing
++ * outside the named partition can be written.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern_xnu.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <machine/atomic.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* osfmk/arm/cpu_data.h, not exported to the BSD layer */
++extern int get_preemption_level(void);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++static void sweet_log_start(void);
++
++#define REG_CAP         0x00
++#define REG_IS          0x20
++#define REG_IE          0x24
++#define REG_HCS         0x30
++#define REG_HCE         0x34
++#define REG_UTRLBA      0x50
++#define REG_UTRLBAU     0x54
++#define REG_UTRLDBR     0x58
++#define REG_UTRLCLR     0x5c
++#define REG_UTRLRSR     0x60
++
++#define HCS_DP          (1u << 0)
++#define HCS_UTRLRDY     (1u << 1)
++#define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
++
++#define UFS_BLOCK       4096u
++#define BOUNCE_SIZE     (1u << 20)
++#define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
++#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
++#define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
++#define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
++#define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
++
++struct utrd {
++	uint32_t dw0, dw1, dw2, dw3;
++	uint32_t ucdba, ucdbau;
++	uint32_t resp;          /* [31:16] response UPIU offset, [15:0] length, DWORDs */
++	uint32_t prdt;          /* [31:16] PRDT offset (DWORDs), [15:0] entries */
++};
++
++struct ucd {
++	uint8_t cmd[512];
++	uint8_t resp[512];
++	struct {
++		uint32_t addr_lo, addr_hi, rsvd, dbc;
++	} prdt[PRDT_MAX];
++};
++
++/* Layout of the contiguous DMA allocation. */
++#define DMA_UTRL        0x0000                  /* 1 KiB aligned */
++#define DMA_UCD         0x1000                  /* 128 byte aligned */
++#define DMA_BOUNCE      0x4000
++#define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
++
++static struct {
++	vm_offset_t regs;
++	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
++	uint64_t dma_pa;
++	uint8_t lun;
++	uint8_t tag;
++	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
++	uint64_t device_blocks;                 /* verified READ CAPACITY(10) geometry */
++	uint32_t secsize;                       /* logical sector size for the BSD layer */
++	bool writable;                          /* boot-arg ufsrw=1 */
++	bool cache;                             /* boot-arg ufscache=1 */
++	bool wait;                              /* boot-arg ufswait=1 */
++	bool perf;                              /* boot-arg lisa_ufs_perf=1 */
++	bool faulted;                           /* timed-out DMA: never reuse slot or buffers */
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} su;
++
++static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
++static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
++
++static inline uint32_t
++ufs_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(su.regs + off);
++}
++
++static inline void
++ufs_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(su.regs + off) = v;
++}
++
++static void
++dma_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
++}
++
++static void
++dma_clean(uint32_t off, uint32_t len)
++{
++	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
++}
++
++/*
++ * One SCSI command in slot 0, data (if any) to/from the bounce buffer
++ * (to the device when write is set). Returns 0 or an errno.
++ */
++static int
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	/* A timeout can leave the controller owning the descriptor and bounce
++	 * buffer even after UTRLCLR. Do not touch either again without a full,
++	 * verified controller recovery, which this driver does not implement. */
++	if (su.faulted) {
++		return EIO;
++	}
++	uint64_t perf_start = su.perf && su.ready ? mach_absolute_time() : 0;
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
++
++	assert(len <= BOUNCE_SIZE);
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++
++	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
++	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
++	ucd->cmd[2] = su.lun;
++	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[12] = (uint8_t)(len >> 24);
++	ucd->cmd[13] = (uint8_t)(len >> 16);
++	ucd->cmd[14] = (uint8_t)(len >> 8);
++	ucd->cmd[15] = (uint8_t)len;
++	memcpy(&ucd->cmd[16], cdb, cdb_len);
++
++	/* DD: 1 = memory to device, 2 = device to memory. */
++	utrd->dw0 = (1u << 28) | ((len ? (write ? 1u : 2u) : 0u) << 25) | (1u << 24);
++	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	if (len) {
++		uint32_t n = 0;
++		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
++			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
++			ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
++			ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
++			ucd->prdt[n].dbc = chunk - 1;
++		}
++		utrd->prdt = (1024u / 4) << 16 | n;
++	}
++
++	if (su.cache) {
++		dma_clean(DMA_UTRL, sizeof(*utrd));
++		dma_clean(DMA_UCD, 16 + cdb_len);
++		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
++		if (len) {
++			dma_clean(DMA_UCD + offsetof(struct ucd, prdt),
++			    (utrd->prdt & 0xffff) * sizeof(ucd->prdt[0]));
++		}
++	} else {
++		dma_sync(DMA_UTRL, sizeof(*utrd));
++		dma_sync(DMA_UCD, sizeof(*ucd));
++	}
++	if (len) {
++		if (su.cache && write) {
++			dma_clean(DMA_BOUNCE, len);
++		} else {
++			dma_sync(DMA_BOUNCE, len);
++		}
++	}
++	__builtin_arm_dsb(0xf);
++
++	ufs_wr(REG_UTRLDBR, 1);
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	bool sleepable = su.wait && su.ready && ml_get_interrupts_enabled() &&
++	    !ml_at_interrupt_context() && get_preemption_level() == 0;
++	uint64_t spin_until = 0, sleep_interval = 0;
++	if (sleepable) {
++		nanoseconds_to_absolutetime(CMD_SPIN_NS, &spin_until);
++		spin_until += mach_absolute_time();
++		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
++	}
++	while (ufs_rd(REG_UTRLDBR) & 1) {
++		uint64_t now = mach_absolute_time();
++		if (now > deadline) {
++			su.faulted = true;
++			ufs_wr(REG_UTRLCLR, ~1u);
++			printf("LISA UFS: command 0x%02x timed out; controller quarantined\n", cdb[0]);
++			return ETIMEDOUT;
++		}
++		if (sleepable && now >= spin_until) {
++			uint64_t wake = now + MIN(sleep_interval, deadline - now);
++			/* Keep the mutex: slot 0 and the bounce buffer are still owned. */
++			if (assert_wait_deadline_with_leeway((event_t)&su.wait, THREAD_UNINT,
++			    TIMEOUT_URGENCY_SYS_CRITICAL, wake, 0) == THREAD_WAITING) {
++				thread_block(THREAD_CONTINUE_NULL);
++			}
++		} else {
++			delay(1);
++		}
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
++
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	if (su.cache) {
++		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
++	} else {
++		dma_sync(DMA_UCD, sizeof(*ucd));
++	}
++	if (len && !(su.cache && write)) {
++		dma_sync(DMA_BOUNCE, len);
++	}
++
++	uint32_t ocs = utrd->dw2 & 0xff;
++	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
++		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
++		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		return EIO;
++	}
++	if (perf_start) {
++		static uint64_t perf_total_us, perf_max_us, perf_bytes;
++		static uint32_t perf_count;
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - perf_start, &ns);
++		uint64_t us = ns / 1000;
++		perf_total_us += us;
++		perf_max_us = MAX(perf_max_us, us);
++		perf_bytes += len;
++		if (++perf_count == 256) {
++			printf("LISA UFS PERF: 256 cmds avg %llu us max %llu us bytes %llu\n",
++			    perf_total_us / perf_count, perf_max_us, perf_bytes);
++			perf_count = 0;
++			perf_total_us = perf_max_us = perf_bytes = 0;
++		}
++	}
++	return 0;
++}
++
++/* Validate the LUN geometry before trusting any on-disk partition metadata. */
++static int
++ufs_read_capacity(void)
++{
++	static const uint8_t cdb[10] = { 0x25 }; /* READ CAPACITY(10) */
++	su.device_blocks = 0;
++	int error = ufs_scsi(cdb, sizeof(cdb), 8, false);
++	if (error) {
++		return error;
++	}
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint32_t last = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
++	    ((uint32_t)b[2] << 8) | b[3];
++	uint32_t size = ((uint32_t)b[4] << 24) | ((uint32_t)b[5] << 16) |
++	    ((uint32_t)b[6] << 8) | b[7];
++	/* 0xffffffff requests READ CAPACITY(16), which is not implemented. */
++	if (last == UINT32_MAX || last < 2 || size != UFS_BLOCK) {
++		printf("LISA UFS: unsupported LUN geometry: last LBA 0x%x block size %u\n", last, size);
++		return ENXIO;
++	}
++	su.device_blocks = (uint64_t)last + 1;
++	return 0;
++}
++
++/* READ(10) of count device blocks at lba into the bounce buffer. */
++static int
++ufs_read_blocks(uint64_t lba, uint32_t count)
++{
++	if (!count || !su.device_blocks || lba >= su.device_blocks ||
++	    count > su.device_blocks - lba || lba > UINT32_MAX ||
++	    count > BOUNCE_SIZE / UFS_BLOCK || count - 1 > UINT32_MAX - lba) {
++		return EINVAL;
++	}
++	uint8_t cdb[10] = {
++		0x28, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
++}
++
++/*
++ * WRITE(10) of count device blocks from the bounce buffer to lba. The range
++ * must lie inside the partition: this is the only place data goes out.
++ */
++static int
++ufs_write_blocks(uint64_t lba, uint32_t count)
++{
++	if (!su.writable || !su.nblocks || !su.device_blocks || lba >= su.device_blocks ||
++	    count > su.device_blocks - lba || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
++	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
++		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
++		return EPERM;
++	}
++	uint8_t cdb[10] = {
++		0x2a, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
++}
++
++static int
++ufs_sync_cache(void)
++{
++	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
++	return ufs_scsi(cdb, sizeof(cdb), 0, false);
++}
++
++static int
++ufs_find_partition(const char *want)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = ufs_read_blocks(1, 1);
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
++		return ENXIO;
++	}
++	uint64_t entry_lba, current, backup, first_usable, last_usable;
++	uint32_t nent, esz, header_size, header_crc, entries_crc;
++	memcpy(&header_size, b + 12, 4);
++	memcpy(&header_crc, b + 16, 4);
++	memcpy(&current, b + 24, 8);
++	memcpy(&backup, b + 32, 8);
++	memcpy(&first_usable, b + 40, 8);
++	memcpy(&last_usable, b + 48, 8);
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	memcpy(&entries_crc, b + 88, 4);
++	if (header_size < 92 || header_size > UFS_BLOCK || current != 1 ||
++	    backup != su.device_blocks - 1 || first_usable > last_usable ||
++	    last_usable >= backup || entry_lba < 2 || esz != 128 ||
++	    nent == 0 || nent > BOUNCE_SIZE / 128) {
++		printf("LISA UFS: invalid GPT header or entry geometry\n");
++		return ENXIO;
++	}
++	uint32_t zero = 0;
++	uint32_t crc = crc32(0, b, 16);
++	crc = crc32(crc, (const uint8_t *)&zero, sizeof(zero));
++	crc = crc32(crc, b + 20, header_size - 20);
++	uint32_t entry_bytes = nent * esz;
++	uint32_t entry_blocks = (entry_bytes + UFS_BLOCK - 1) / UFS_BLOCK;
++	if (crc != header_crc || entry_lba >= first_usable ||
++	    entry_blocks > first_usable - entry_lba) {
++		printf("LISA UFS: GPT header checksum or range invalid\n");
++		return ENXIO;
++	}
++	error = ufs_read_blocks(entry_lba, entry_blocks);
++	if (error) {
++		return error;
++	}
++	if (crc32(0, b, entry_bytes) != entries_crc) {
++		printf("LISA UFS: GPT entry checksum invalid\n");
++		return ENXIO;
++	}
++	bool found = false;
++	uint64_t selected_first = 0, selected_last = 0;
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch > 0x7f) {
++				name[0] = 0;
++				c = 0;
++				break;
++			}
++			if (ch == 0) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t first, last;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		bool used = false;
++		for (unsigned j = 0; j < 16; j++) {
++			used |= e[j] != 0;
++		}
++		if (!used || found || first < first_usable || last > last_usable || last < first) {
++			printf("LISA UFS: invalid or duplicate selected GPT partition\n");
++			return ENXIO;
++		}
++		found = true;
++		selected_first = first;
++		selected_last = last;
++	}
++	if (found) {
++		su.first_block = selected_first;
++		su.nblocks = selected_last - selected_first + 1;
++		return 0;
++	}
++	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
++static int
++ufs_take_over_host(void)
++{
++	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
++	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
++		printf("SWEET UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
++		return ENXIO;
++	}
++	if (ufs_rd(REG_UTRLDBR)) {
++		printf("SWEET UFS: requests outstanding from the bootloader\n");
++		return EBUSY;
++	}
++	/* With RAM above 4 GiB (mkadt.py --highmem) the DMA memory can be there too. */
++	if (((su.dma_pa + DMA_SIZE - 1) >> 32) && !(ufs_rd(REG_CAP) & CAP_64AS)) {
++		printf("SWEET UFS: DMA memory at 0x%llx but the host has no 64-bit addressing\n",
++		    su.dma_pa);
++		return ENXIO;
++	}
++	ufs_wr(REG_IE, 0);                      /* polled operation */
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	ufs_wr(REG_UTRLRSR, 0);
++	uint64_t list = su.dma_pa + DMA_UTRL;
++	ufs_wr(REG_UTRLBA, (uint32_t)list);
++	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
++	ufs_wr(REG_UTRLRSR, 1);
++	/* Never ring a doorbell unless the host uses our list. */
++	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
++	    !(ufs_rd(REG_UTRLRSR) & 1)) {
++		printf("SWEET UFS: host did not take our request list\n");
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!su.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !su.writable) ? EROFS : 0;
++}
++
++static int
++sweet_ufs_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++sweet_ufs_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = 0;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (buf_blkno(bp) < 0 || (uint64_t)buf_blkno(bp) > UINT64_MAX / su.secsize ||
++	    su.nblocks > UINT64_MAX / UFS_BLOCK) {
++		error = EINVAL;
++		goto done;
++	}
++	off = (uint64_t)buf_blkno(bp) * su.secsize;
++	if (!rd && !su.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / UFS_BLOCK;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		void *bounce = (void *)(su.dma + DMA_BOUNCE);
++		if (rd) {
++			error = ufs_read_blocks(su.first_block + lba, blocks);
++			if (!error) {
++				memcpy(vaddr + done, (const char *)bounce + skip, want);
++			}
++		} else {
++			/* Partial device blocks at either end: read, merge, write back. */
++			if (skip || (want % UFS_BLOCK)) {
++				error = ufs_read_blocks(su.first_block + lba, blocks);
++			}
++			if (!error) {
++				memcpy((char *)bounce + skip, vaddr + done, want);
++				error = ufs_write_blocks(su.first_block + lba, blocks);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = su.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > UFS_BLOCK || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		su.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = UFS_BLOCK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = su.nblocks * UFS_BLOCK / su.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = su.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE: {
++		if (!su.writable) {
++			return 0;
++		}
++		lck_mtx_lock(&sweet_ufs_lock);
++		int error = ufs_sync_cache();
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return error;
++	}
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = BOUNCE_SIZE / su.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = su.writable ? BOUNCE_SIZE / su.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++sweet_ufs_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_ufs_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++sweet_ufs_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_ufs_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++sweet_ufs_psize(__unused dev_t dev)
++{
++	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
++}
++
++static int
++sweet_ufs_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(sweet_ufs_strategy, NULL, dev, B_READ, minphys, uio, (int)su.secsize);
++}
++
++static int
++sweet_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!su.writable) {
++		return EROFS;
++	}
++	return physio(sweet_ufs_strategy, NULL, dev, B_WRITE, minphys, uio, (int)su.secsize);
++}
++
++static const struct bdevsw sweet_ufs_bdevsw = {
++	.d_open     = sweet_ufs_open,
++	.d_close    = sweet_ufs_close,
++	.d_strategy = sweet_ufs_strategy,
++	.d_ioctl    = sweet_ufs_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = sweet_ufs_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw sweet_ufs_cdevsw = {
++	.d_open       = sweet_ufs_open,
++	.d_close      = sweet_ufs_close,
++	.d_read       = sweet_ufs_read,
++	.d_write      = sweet_ufs_write,
++	.d_ioctl      = sweet_ufs_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++/* Read-only, conservative check of the firmware's visible UFS SMMU route.
++ * This cannot prove hidden-stage security policy or safe controller ownership. */
++static int
++lisa_ufs_smmu_check(volatile const uint32_t *smmu)
++{
++	uint32_t id0 = smmu[0x20 / 4], id1 = smmu[0x24 / 4];
++	unsigned count = id0 & 0xffu, banks = id1 & 0xffu;
++	if (!(id0 & (1u << 27)) || !count || count > 128 || !banks) {
++		return ENXIO;
++	}
++	unsigned matches = 0, bank = 0;
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t smr = smmu[(0x800 + 4 * i) / 4];
++		if (!(smr & (1u << 31))) continue;
++		uint32_t mask = (smr >> 16) & 0x7fffu, id = smr & 0xffffu;
++		if ((0x80u & ~mask & 0xffffu) != (id & ~mask & 0xffffu)) continue;
++		if (mask != 0 || id != 0x80u) return ENXIO;
++		uint32_t s2cr = smmu[(0xc00 + 4 * i) / 4];
++		if (((s2cr >> 16) & 3u) != 0 || (s2cr & 0xffu) >= banks) return ENXIO;
++		bank = s2cr & 0xffu;
++		matches++;
++	}
++	if (matches != 1) return ENXIO;
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t smr = smmu[(0x800 + 4 * i) / 4];
++		if (!(smr & (1u << 31))) continue;
++		uint32_t mask = (smr >> 16) & 0x7fffu, id = smr & 0xffffu;
++		if ((0x80u & ~mask & 0xffffu) == (id & ~mask & 0xffffu)) continue;
++		uint32_t s2cr = smmu[(0xc00 + 4 * i) / 4];
++		if (((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == bank) return ENXIO;
++	}
++	unsigned shift = id1 & (1u << 31) ? 16 : 12;
++	unsigned pages = 1u << (((id1 >> 28) & 7u) + 1);
++	uint64_t cb = ((uint64_t)pages + bank) << shift;
++	uint64_t cbar = ((uint64_t)1 << shift) + 4 * bank;
++	if (cb > 0x100000u - 0x5cu || cbar > 0x100000u - 4u) return ENXIO;
++	uint32_t ctl = smmu[cb / 4], fsr = smmu[(cb + 0x58) / 4];
++	uint32_t cbtype = (smmu[cbar / 4] >> 16) & 3u;
++	/* FSR[10:9] is format, not a fault; reject all fault and stalled bits. */
++	if ((ctl & 1u) || cbtype != 1u || (fsr & 0xc00001feu)) return ENXIO;
++	return 0;
++}
++
++static int
++sweet_ufs_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	char want[64] = "userdata";
++	int error;
++
++	/* Experimental opt-in. Keep the default fully disabled. */
++	uint32_t lisa_probe = 0;
++	PE_parse_boot_argn("lisa_ufs_probe", &lisa_probe, sizeof(lisa_probe));
++	if (lisa_probe != 1) return ENXIO;
++	vm_offset_t smmu = ml_io_map(0x15000000, 0x100000);
++	if (!smmu || lisa_ufs_smmu_check((volatile const uint32_t *)smmu)) {
++		printf("LISA UFS: SMMU preflight rejected\n");
++		return ENXIO;
++	}
++
++	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
++		return ENXIO;
++	}
++	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	uint32_t rw = 0;
++	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
++	uint32_t lisa_write = 0;
++	PE_parse_boot_argn("lisa_ufs_write", &lisa_write, sizeof(lisa_write));
++	if (rw && (rw != 1 || lisa_write != 1 || strcmp(want, "userdata") != 0)) {
++		printf("LISA UFS: writable access requires explicit userdata opt-in\n");
++		return EROFS;
++	}
++	/* Sleepable callers yield after 50us while the command owns slot0, rather
++     * than burning a core for the full device latency. ufswait=0 restores polling. */
++    uint32_t cache = 0, wait = 1;
++	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
++	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
++	su.cache = (cache == 1);
++	su.wait = (wait == 1);
++	uint32_t perf = 0;
++	PE_parse_boot_argn("lisa_ufs_perf", &perf, sizeof(perf));
++	su.perf = (perf == 1);
++
++	su.regs = ml_io_map(reg[0], reg[1]);
++	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET UFS: no contiguous DMA memory\n");
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	su.dma_pa = ptoa_64(pn);
++	su.lun = 0;
++	su.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_take_over_host();
++	if (!error) {
++		static const uint8_t tur[6] = { 0x00 };
++		/* The first command after the bootloader may report a unit attention. */
++		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		}
++	}
++	if (!error) {
++		error = ufs_read_capacity();
++	}
++	if (!error) {
++		error = ufs_find_partition(want);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		return error;
++	}
++
++	su.writable = (rw != 0);
++	su.ready = true;
++	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
++	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
++	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	return 0;
++}
++
++static int
++lisa_ufs_publish(void)
++{
++	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
++	if (su.bmajor < 0) {
++		return ENXIO;
++	}
++	su.cmajor = cdevsw_add_with_bdev(-1, &sweet_ufs_cdevsw, su.bmajor);
++	if (su.cmajor < 0) {
++		return ENXIO;
++	}
++	su.bdev = makedev(su.bmajor, 0);
++	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
++	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
++	uint32_t lisa_log = 0;
++	PE_parse_boot_argn("lisa_ufs_log", &lisa_log, sizeof(lisa_log));
++	if (lisa_log == 1) sweet_log_start();
++	return 0;
++}
++
++/*
++ * Persistent console log ("sweetlog"). Filming the phone screen is the only
++ * other way to see the console, so every character that reaches the
++ * console (kernel printf and /dev/console writes of daemons, both through
++ * _cnputs) is also kept in a 4 MiB ring, and once the partition is known
++ * and writable a thread copies new ring blocks to the LAST 4 MiB + 4 KiB of
++ * the partition every ufslogsecs seconds (default 10), far behind the HFS
++ * image at its start. Device block 0 of that area is a header:
++ *   "SWEETLOG" | u32 version 1 | u32 ring size | u64 total bytes written
++ *   | u64 flush sequence
++ * ring offset of byte n = n % ring size. Read it from a recovery with
++ * tools/sweet-log-pull.sh. Disabled with boot-arg sweetlog=0.
++ */
++#define SWEET_LOG_SIZE          (4u << 20)
++#define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
++#define SWEET_LOG_SECS          10u
++
++static char sweet_log_ring[SWEET_LOG_SIZE];
++static uint64_t _Atomic sweet_log_total;
++static int sweet_log_chan;
++static bool lisa_log_allowed;
++static uint32_t sweet_log_secs = SWEET_LOG_SECS;
++
++/* Called for all console output, any context: never blocks. */
++void sweet_log_append(const char *c, int size);
++
++void
++sweet_log_append(const char *c, int size)
++{
++	if (size <= 0) {
++		return;
++	}
++	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
++	}
++}
++
++/*
++ * Copy console bytes [*pos, total) (at most max) for live log streaming
++ * (sweet_usb.c). A reader that fell more than the ring behind skips ahead.
++ * Returns the byte count; *pos advances.
++ */
++uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++
++uint32_t
++sweet_log_copy(uint64_t *pos, char *out, uint32_t max)
++{
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	if (total - *pos > SWEET_LOG_SIZE) {
++		*pos = total - SWEET_LOG_SIZE;
++	}
++	uint32_t n = (uint32_t)MIN((uint64_t)max, total - *pos);
++	for (uint32_t i = 0; i < n; i++) {
++		out[i] = sweet_log_ring[(*pos + i) % SWEET_LOG_SIZE];
++	}
++	*pos += n;
++	return n;
++}
++
++uint64_t sweet_log_position(void);
++
++uint64_t
++sweet_log_position(void)
++{
++	return os_atomic_load(&sweet_log_total, relaxed);
++}
++
++static bool lisa_log_panicking;
++
++struct sweet_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++/*
++ * Synchronous checkpoint for code that may deliberately exercise a secure
++ * boundary before the scheduler can run sweet_log_thread().  It writes the
++ * same guarded userdata tail used by the periodic logger; no filesystem
++ * blocks are touched.  GPU PAS uses this immediately before an SMC so a
++ * reset inside secure world leaves an actionable breadcrumb.
++ */
++void
++sweet_log_checkpoint(void)
++{
++	static uint64_t seq;
++	uint64_t total, pos, base;
++	int error = 0;
++
++	if (!su.ready || !su.writable || !lisa_log_allowed || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		return;
++	}
++	total = os_atomic_load(&sweet_log_total, relaxed);
++	if (!total) {
++		return;
++	}
++	base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	pos = total > SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : 0;
++	/* A panic cannot wait for a mutex or sleep: whatever held the slot is over. */
++	bool stopping = lisa_log_panicking;
++	if (stopping) {
++		su.wait = false;
++	} else {
++		lck_mtx_lock(&sweet_ufs_lock);
++	}
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		memcpy((void *)(su.dma + DMA_BOUNCE), sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		error = ufs_write_blocks(base + 1 + blk, n);
++		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++	}
++	if (!error) {
++		struct sweet_log_header h = { .magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++			.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq };
++		bzero((void *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
++		memcpy((void *)(su.dma + DMA_BOUNCE), &h, sizeof(h));
++		error = ufs_write_blocks(base, 1);
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	if (!stopping) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++	}
++	if (error) {
++		printf("SWEET LOG: synchronous checkpoint failed (%d)\n", error);
++	}
++}
++
++/* The last of the log before the phone resets (panic, or the end of a test boot). */
++void lisa_log_final(void);
++
++void
++lisa_log_final(void)
++{
++	lisa_log_panicking = true;
++	sweet_log_checkpoint();
++}
++
++static void
++sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	uint64_t flushed = 0, seq = 0;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++
++	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
++	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
++	/* Lisa: a test boot that does not panic ends here (boot-arg lisa_reset_secs), so the Mac gets the log. */
++	uint32_t reset_secs = 0;
++	uint32_t waited = 0;
++	PE_parse_boot_argn("lisa_reset_secs", &reset_secs, sizeof(reset_secs));
++	for (;;) {
++		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
++		waited += sweet_log_secs;
++		if (reset_secs && waited >= reset_secs) {
++			extern void lisa_reset_after(uint32_t seconds);
++			printf("LISA: test boot over after %u s\n", waited);
++			lisa_reset_after(0);
++		}
++		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++		if (total == flushed) {
++			continue;
++		}
++		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
++		int error = 0;
++
++		lck_mtx_lock(&sweet_ufs_lock);
++		while (pos < total && !error) {
++			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++			uint32_t blk = off / UFS_BLOCK;
++			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++			memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++			error = ufs_write_blocks(base + 1 + blk, n);
++			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++		}
++		if (!error) {
++			struct sweet_log_header h = {
++				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++				.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
++			};
++			bzero(bounce, UFS_BLOCK);
++			memcpy(bounce, &h, sizeof(h));
++			error = ufs_write_blocks(base, 1);
++		}
++		if (!error) {
++			error = ufs_sync_cache();
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (error) {
++			printf("SWEET LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++static void
++sweet_log_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
++	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		return;
++	}
++	/* The ring is raw partition tail space. iOS 26's userdata starts with the SHNGROOT manifest (build-lisa-root.py):
++	 * no log write unless the image it describes ends before the log area. */
++	lck_mtx_lock(&sweet_ufs_lock);
++	int err = ufs_read_blocks(su.first_block, 1);
++	const uint8_t *h = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint64_t image = 0;
++	memcpy(&image, h + 16, sizeof(image));
++	bool safe = !err && memcmp(h, "SHNGROOT", 8) == 0 && image && image <= (su.nblocks - SWEET_LOG_BLOCKS) * UFS_BLOCK;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (!safe) {
++		printf("LISA LOG: not the SHNGROOT layout; logging disabled\n");
++		return;
++	}
++	lisa_log_allowed = true;
++	PE_parse_boot_argn("ufslogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
++	if (sweet_log_secs == 0 || sweet_log_secs > 60) {
++		sweet_log_secs = SWEET_LOG_SECS;
++	}
++	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++int lisa_ufs_host_start(void);
++
++int
++lisa_ufs_host_start(void)
++{
++	/* NativeUfs's IOKit start and the root search can both get here first: the host starts once. */
++	static LCK_MTX_DECLARE(start_lock, &sweet_ufs_grp);
++	int error = 0;
++
++	lck_mtx_lock(&start_lock);
++	if (!su.ready) {
++		error = sweet_ufs_init();
++	}
++	lck_mtx_unlock(&start_lock);
++	return error;
++}
++
++/* Root device for rd=ufsroot0 (IOFindBSDRoot). */
++int sweet_ufs_rootdev(dev_t *dev);
++
++int
++sweet_ufs_rootdev(dev_t *dev)
++{
++	static bool published;
++	int error = lisa_ufs_host_start();
++
++	if (error) {
++		return error;
++	}
++	if (!published) {
++		published = true;
++		error = lisa_ufs_publish();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = su.bdev;
++	return 0;
++}
++
++/* NativeUfs's transport (LISA_UFS_HOST): the same polled host, one command at a time. lba: 4 KiB blocks of LUN 0. */
++int lisa_ufs_host_read(uint64_t lba, uint32_t blocks, void *dst);
++
++int
++lisa_ufs_host_read(uint64_t lba, uint32_t blocks, void *dst)
++{
++	int error;
++
++	if (!su.ready || !blocks || blocks > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_read_blocks(lba, blocks);
++	if (!error) {
++		memcpy(dst, (void *)(su.dma + DMA_BOUNCE), blocks * UFS_BLOCK);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 2bbd161..fc530bd 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -679,6 +679,13 @@ kern_return_t
+ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+     dev_t * root, u_int32_t * oflags )
+ {
++	{
++		/* Lisa: storage and the log on it. Not the root yet: that takes APFS. */
++		extern int lisa_ufs_rootdev(dev_t *dev) __asm__("_sweet_ufs_rootdev");
++		dev_t lisa_dev;
++		int lisa_err = lisa_ufs_rootdev(&lisa_dev);
++		printf("LISA UFS: start %d\n", lisa_err);
++	}
+ 	mach_timespec_t     t;
+ 	IOService *         service;
+ 	IORegistryEntry *   regEntry;
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index ed18a4a..cf5a9f4 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -345,6 +345,8 @@ arm_auxkc_init(void *mh, void *base)
+  *		Function:		Runs on the boot CPU, once, on entry from iBoot.
+  */
+ 
++extern void lisa_early_mark(uint32_t n, uint32_t color);
++
+ __startup_func
+ void
+ arm_init(
+@@ -357,9 +359,12 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++	lisa_early_mark(0, 0xffffff00u);
+ 	arm_slide_rebase_and_sign_image();
++	lisa_early_mark(1, 0xffffff00u);
+ 
+ 	arm_static_if_init(args);
++	lisa_early_mark(2, 0xffffff00u);
+ 
+ 	/* If kernel integrity is supported, use a constant copy of the boot args. */
+ 	const_boot_args = *args;
+@@ -376,7 +381,9 @@ arm_init(
+ 	BootCpuData.jop_key = ml_default_jop_pid();
+ #endif /* defined(HAS_APPLE_PAC) */
+ 
++	lisa_early_mark(3, 0xffffff00u);
+ 	PE_init_platform(FALSE, args); /* Get platform expert set up */
++	lisa_early_mark(4, 0xffffff00u);
+ 	boot_progress_init();
+ 
+ #if __arm64__
+@@ -496,7 +503,9 @@ arm_init(
+ 	rtclock_early_init();
+ 
+ 	kernel_debug_string_early("kernel_startup_bootstrap");
++	lisa_early_mark(5, 0xffffff00u);
+ 	kernel_startup_bootstrap();
++	lisa_early_mark(6, 0xffffff00u);
+ 
+ 	/*
+ 	 * Initialize the timer callout world
+@@ -572,6 +581,7 @@ arm_init(
+ 	pmap_first_pnum = (ppnum_t)atop(gDramBase);
+ 
+ 	boot_progress_stage("arm_vm_init enter");
++	lisa_early_mark(7, 0xffffff00u);
+ 	arm_vm_init(xmaxmem, args);
+ 	boot_progress_stage("arm_vm_init returned");
+ 
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 0ac4b57..e6d083a 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1807,6 +1807,9 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #define ARM64_PHYSMAP_SLIDE_RANGE (1ULL << 30) // 1 GB
+ #define ARM64_PHYSMAP_SLIDE_MASK  (ARM64_PHYSMAP_SLIDE_RANGE - 1)
+ 
++extern void lisa_early_mark(uint32_t n, uint32_t color);
++extern bool lisa_early_off;
++
+ void
+ arm_vm_init(uint64_t memory_size, boot_args * args)
+ {
+@@ -2168,6 +2171,8 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	ml_enable_monitor();
+ #endif
+ 
++	lisa_early_mark(8, 0xffffff00u);
++	lisa_early_off = true;
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+ 	flush_mmu_tlb();
+@@ -2280,7 +2285,8 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	mem_segments = (mem_size + 0x0FFFFFFF) >> 28;
+ 
+ 	va_l1 = dynamic_memory_begin;
+-	va_l1_end = va_l1 + ((2 + (mem_segments * 10)) << 20);
++	/* Lisa: 10 MB per 256 MB is for 16 KiB pages; a 4 KiB kernel tracks four times as many. */
++	va_l1_end = va_l1 + ((2 + (mem_segments * 40)) << 20);
+ 	va_l1_end += round_page(args->Video.v_height * args->Video.v_rowBytes);
+ 	va_l1_end = (va_l1_end + 0x00000000007FFFFFULL) & 0xFFFFFFFFFF800000ULL;
+ 
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index d6fff49..cf64bf0 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -669,6 +669,15 @@ panic_with_thread_kernel_state(const char *msg, arm_saved_state_t *ss)
+ void
+ sleh_synchronous_sp1(arm_context_t *context, uint64_t esr, vm_offset_t far __unused)
+ {
++	{
++		extern void lisa_early_text(const char *);
++		extern void lisa_early_hex(const char *, uint64_t);
++		lisa_early_text("exception sp1\n");
++		lisa_early_hex("esr ", esr);
++		lisa_early_hex("far ", far);
++		lisa_early_hex("pc  ", get_saved_state_pc(&context->ss));
++		lisa_early_hex("lr  ", get_saved_state_lr(&context->ss));
++	}
+ 	esr_exception_class_t  class = ESR_EC(esr);
+ 	arm_saved_state_t    * state = &context->ss;
+ 
+@@ -777,6 +786,15 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
+ 	int                    preemption_level = sleh_get_preemption_level();
+ #endif
+ 	expected_fault_handler_t expected_fault_handler = NULL;
++	{
++		extern void lisa_early_text(const char *);
++		extern void lisa_early_hex(const char *, uint64_t);
++		lisa_early_text("exception\n");
++		lisa_early_hex("esr ", esr);
++		lisa_early_hex("far ", far);
++		lisa_early_hex("pc  ", get_saved_state_pc(&context->ss));
++		lisa_early_hex("lr  ", get_saved_state_lr(&context->ss));
++	}
+ #ifdef CONFIG_XNUPOST
+ 	expected_fault_handler_t saved_expected_fault_handler = NULL;
+ 	uintptr_t saved_expected_fault_addr = 0;
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 819f90f..740c92e 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -522,6 +522,16 @@ LEXT(start_first_cpu)
+ 	mov		x20, x0
+ 	mov		x21, #0
+ 
++	// Lisa: a bar on the boot framebuffer (MMU off), so an early death still leaves evidence.
++	MOV64	x9, 0xe1000000 + 1800 * 4320
++	MOV64	x10, 0xff00ff00ff00ff00
++	MOV64	x11, 40 * 4320 / 8
++1:
++	str		x10, [x9], #8
++	subs	x11, x11, #1
++	b.ne	1b
++	dsb		sy
++
+ 	// Set low reset vector before attempting any loads
+ 	adrp	x0, EXT(LowExceptionVectorBase)@page
+ 	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
+@@ -668,6 +678,20 @@ Lkernelcache_base_found:
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
++	// Lisa: the framebuffer in the V=P tables, for lisa_early_mark() (35 MiB: 18 2 MiB blocks)
++	MOV64	x14, 0xe1000000
++	mov		x15, x14
++	mov		x1, x25
++	mov		x5, #18
++	create_bootstrap_mapping x14, x15, x5, x1, x2, x9, x10, x11, x12, x13
++
++	// Lisa: and the ramoops area, for lisa_log_char()
++	MOV64	x14, 0xa9000000
++	mov		x15, x14
++	mov		x1, x25
++	mov		x5, #1
++	create_bootstrap_mapping x14, x15, x5, x1, x2, x9, x10, x11, x12, x13
++
+ 	b Lbootstrap_tables_ready
+ Lbootstrap_tables_exhausted:
+ 	// MMU is still off. Stop with the offending cursor/end preserved for
+@@ -818,6 +842,16 @@ common_start:
+ 	PAC_INIT_KEY_STATE tmp=x0, tmp2=x1
+ #endif /* HAS_APPLE_PAC */
+ 
++	// Lisa: a bar on the boot framebuffer (MMU off), so an early death still leaves evidence.
++	MOV64	x9, 0xe1000000 + 1860 * 4320
++	MOV64	x10, 0xff0000ffff0000ff
++	MOV64	x11, 40 * 4320 / 8
++1:
++	str		x10, [x9], #8
++	subs	x11, x11, #1
++	b.ne	1b
++	dsb		sy
++
+ 	// Enable caches, MMU, ROP and JOP
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 48f9405..734b205 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1107,6 +1107,22 @@ panic(const char *str, ...)
+ {
+ 	va_list panic_str_args;
+ 
++	{
++		extern void lisa_early_text(const char *);
++		lisa_early_text("panic: ");
++		lisa_early_text(str);
++		lisa_early_text("\n");
++	}
++	{
++		/* Lisa: the call chain on the console, before the panic path; atos against the unstripped kernel. */
++		uintptr_t *fp = (uintptr_t *)__builtin_frame_address(0);
++		printf("lisa panic chain:\n");
++		for (int i = 0; i < 16 && fp != NULL && ((uintptr_t)fp & 15) == 0 && (uintptr_t)fp >= 0xfffffff000000000ul; i++) {
++			printf(" %d %lx\n", i, fp[1]);
++			fp = (uintptr_t *)fp[0];
++		}
++	}
++
+ 	va_start(panic_str_args, str);
+ 	panic_trap_to_debugger(str, &panic_str_args, 0, NULL, 0, NULL, (unsigned long)(char *)__builtin_return_address(0), NULL);
+ 	va_end(panic_str_args);
+@@ -1370,6 +1386,11 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ void __attribute__((noinline, optnone))
+ panic_spin_forever(void)
+ {
++	/* Lisa: nothing can attach to this phone: reset, and the recovery holds the log (lisa_log_char). */
++	{
++		extern void lisa_reset_after(uint32_t seconds);
++		lisa_reset_after(5);
++	}
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 733eadd..c2f7ecc 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -890,6 +890,346 @@ get_serial_device_phandle(uint32_t * const phandle)
+ 	return serial_device_phandle_specified;
+ }
+ 
++/*
++ * Lisa: the console also goes to the phone's ramoops area, in the format of Linux's persistent_ram_buffer. The recovery's
++ * kernel gives all 2 MiB at 0xa9000000 to pmsg, so after a reset the log is the file /sys/fs/pstore/pmsg-ramoops-0.
++ * Through the bootstrap V=P mapping until fbcon_probe maps it.
++ */
++#define LISA_RING_PA            0xa9000000ul
++#define LISA_RING_SIZE          0x200000u
++#define LISA_RING_HEADER        12u
++#define LISA_RING_CAPACITY      (LISA_RING_SIZE - LISA_RING_HEADER)
++#define LISA_RING_SIG           0x43474244u     /* PERSISTENT_RAM_SIG */
++
++extern bool lisa_early_off;
++static volatile uint8_t *lisa_ring;
++static bool lisa_ring_cached, lisa_ring_resetting;
++static uint32_t lisa_ring_pos, lisa_ring_used, lisa_ring_match;
++
++void
++lisa_reset(void)
++{
++	register uint64_t x0 __asm__("x0");
++	register uint64_t x1 __asm__("x1");
++	register uint64_t x2 __asm__("x2");
++
++	__asm__ volatile ("dsb sy");
++	/* PSCI 1.1 SYSTEM_RESET2, warm: what keeps RAM. If firmware refuses it, SYSTEM_RESET. */
++	x0 = 0xc4000012ul;
++	x1 = 0;
++	x2 = 0;
++	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2) : : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
++	    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	x0 = 0x84000009ul;
++	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2) : : "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
++	    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	for (;;) {
++		__asm__ volatile ("wfe");
++	}
++}
++
++/* Seconds by the architectural counter (19.2 MHz here), which needs nothing set up. */
++void
++lisa_reset_after(uint32_t seconds)
++{
++	uint64_t now, until;
++	extern void lisa_log_final(void);
++
++	lisa_log_final();
++	__asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (now));
++	until = now + seconds * 19200000ull;
++	do {
++		__asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (now));
++	} while (now < until);
++	lisa_reset();
++}
++
++static void
++lisa_ring_flush(volatile void *p, uint32_t bytes)
++{
++	if (!lisa_ring_cached) {
++		return;
++	}
++	for (uintptr_t a = (uintptr_t)p & ~63ul; a < (uintptr_t)p + bytes; a += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (a));
++	}
++	__asm__ volatile ("dsb sy");
++}
++
++static void
++lisa_ring_begin(volatile uint8_t *base, bool cached)
++{
++	volatile uint32_t *header = (volatile uint32_t *)base;
++
++	lisa_ring_cached = cached;
++	lisa_ring = base;
++	header[0] = LISA_RING_SIG;
++	header[1] = lisa_ring_pos;
++	header[2] = lisa_ring_used;
++	lisa_ring_flush(base, LISA_RING_HEADER);
++}
++
++void
++lisa_log_char(uint8_t c)
++{
++	static const char done[] = "Still waiting for root device";
++
++	if (lisa_ring == NULL) {
++		if (lisa_early_off) {
++			return;
++		}
++		lisa_ring_begin((volatile uint8_t *)LISA_RING_PA, true);
++	}
++	volatile uint32_t *header = (volatile uint32_t *)lisa_ring;
++	volatile uint8_t *at = lisa_ring + LISA_RING_HEADER + lisa_ring_pos;
++
++	{
++		extern void sweet_log_append(const char *c, int size);
++		sweet_log_append((const char *)&c, 1);
++	}
++	*at = c;
++	lisa_ring_flush(at, 1);
++	lisa_ring_pos = (lisa_ring_pos + 1) % LISA_RING_CAPACITY;
++	if (lisa_ring_used < LISA_RING_CAPACITY) {
++		lisa_ring_used++;
++	}
++	header[1] = lisa_ring_pos;
++	header[2] = lisa_ring_used;
++	lisa_ring_flush(header, LISA_RING_HEADER);
++
++	/* This far is a whole boot while the kernel has no root device: stop here, so the Mac gets the log. */
++	lisa_ring_match = (c == (uint8_t)done[lisa_ring_match]) ? lisa_ring_match + 1 : 0;
++	if (done[lisa_ring_match] == '\0' && !lisa_ring_resetting) {
++		lisa_ring_resetting = true;
++		lisa_reset_after(3);
++	}
++}
++
++/*
++ * Lisa: squares and text on the boot framebuffer before the console exists, through the bootstrap V=P mapping
++ * start.s adds for it. Usable until arm_vm_init takes TTBR0 away (lisa_early_off), then the console takes over.
++ */
++extern unsigned char iso_font[256 * 16];
++bool lisa_early_off;
++static uint32_t lisa_early_col, lisa_early_row;
++
++#define LISA_EARLY_FB           ((volatile uint32_t *)0xe1000000ul)
++#define LISA_EARLY_STRIDE       1080
++
++static void
++lisa_early_flush(volatile uint32_t *p, uint32_t pixels)
++{
++	for (uintptr_t a = (uintptr_t)p & ~63ul; a < (uintptr_t)(p + pixels); a += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (a));
++	}
++	__asm__ volatile ("dsb sy");
++}
++
++void
++lisa_early_mark(uint32_t n, uint32_t color)
++{
++	if (lisa_early_off) {
++		return;
++	}
++	for (uint32_t y = 0; y < 50; y++) {
++		volatile uint32_t *line = LISA_EARLY_FB + (1950 + y) * LISA_EARLY_STRIDE + 10 + n * 60;
++		for (uint32_t x = 0; x < 50; x++) {
++			line[x] = color;
++		}
++		lisa_early_flush(line, 50);
++	}
++}
++
++void
++lisa_early_text(const char *s)
++{
++	if (lisa_early_off) {
++		return;
++	}
++	for (; *s != '\0'; s++) {
++		lisa_log_char((uint8_t)*s);
++		if (*s == '\n' || lisa_early_col >= 66) {
++			lisa_early_col = 0;
++			lisa_early_row++;
++			if (*s == '\n') {
++				continue;
++			}
++		}
++		const unsigned char *glyph = iso_font + (unsigned char)*s * 16;
++		for (uint32_t gy = 0; gy < 32; gy++) {
++			volatile uint32_t *line = LISA_EARLY_FB + (620 + lisa_early_row * 34 + gy) * LISA_EARLY_STRIDE + 10 + lisa_early_col * 16;
++			for (uint32_t gx = 0; gx < 16; gx++) {
++				line[gx] = (glyph[gy / 2] & (1u << (gx / 2))) ? 0xffffffffu : 0xff400000u;
++			}
++			lisa_early_flush(line, 16);
++		}
++		lisa_early_col++;
++	}
++}
++
++void
++lisa_early_hex(const char *label, uint64_t value)
++{
++	char digits[20];
++	lisa_early_text(label);
++	for (int i = 0; i < 16; i++) {
++		unsigned d = (value >> (60 - i * 4)) & 15;
++		digits[i] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
++	}
++	digits[16] = '\n';
++	digits[17] = '\0';
++	lisa_early_text(digits);
++}
++
++#if defined(XNU_ARM_DT_PLATFORM) && XNU_ARM_DT_PLATFORM
++/*
++ * Lisa: kprintf on the boot framebuffer, for a board with no usable UART. The port of the xnu-8796 Lisa
++ * kernel's console. The ADT node "sweet-fbcon" describes it: reg = <phys size>, width, height, stride.
++ * Lines wrap back to the top; the line after the cursor stays blank so the newest output is easy to find.
++ */
++#define FBCON_SCALE     2
++#define FBCON_FG        0xffffffffu
++#define FBCON_BG        0xff000000u
++
++static volatile uint32_t *fbcon_base;
++static uint32_t fbcon_width, fbcon_height, fbcon_stride;
++static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
++static uint64_t fbcon_draw_until;
++
++static void
++fbcon_clear_row(uint32_t row)
++{
++	for (uint32_t y = row * 16 * FBCON_SCALE; y < (row + 1) * 16 * FBCON_SCALE; y++) {
++		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
++		for (uint32_t x = 0; x < fbcon_width; x++) {
++			line[x] = FBCON_BG;
++		}
++	}
++}
++
++static void
++fbcon_newline(void)
++{
++	fbcon_col = 0;
++	fbcon_row = (fbcon_row + 1) % fbcon_rows;
++	fbcon_clear_row(fbcon_row);
++	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
++}
++
++static void
++fbcon_transmit_data(uint8_t c)
++{
++	lisa_log_char(c);
++	if (fbcon_draw_until && mach_absolute_time() >= fbcon_draw_until) {
++		return;
++	}
++	if (c == '\r') {
++		fbcon_col = 0;
++		return;
++	}
++	if (c == '\n') {
++		fbcon_newline();
++		return;
++	}
++	if (fbcon_col >= fbcon_cols) {
++		fbcon_newline();
++	}
++	const unsigned char *glyph = iso_font + c * 16;
++	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
++	for (uint32_t gy = 0; gy < 16; gy++) {
++		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
++			volatile uint32_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
++			for (uint32_t gx = 0; gx < 8; gx++) {
++				uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
++				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
++					line[gx * FBCON_SCALE + sx] = px;
++				}
++			}
++		}
++	}
++	fbcon_col++;
++}
++
++static void
++fbcon_init(void)
++{
++}
++
++static unsigned int
++fbcon_transmit_ready(void)
++{
++	return 1;
++}
++
++static unsigned int
++fbcon_receive_ready(void)
++{
++	return 0;
++}
++
++static uint8_t
++fbcon_receive_data(void)
++{
++	return 0;
++}
++
++static struct pe_serial_functions fbcon_functions = {
++	.init = fbcon_init,
++	.transmit_ready = fbcon_transmit_ready,
++	.transmit_data = fbcon_transmit_data,
++	.receive_ready = fbcon_receive_ready,
++	.receive_data = fbcon_receive_data,
++};
++
++static bool
++fbcon_probe(void)
++{
++	DTEntry entry;
++	uint64_t const *reg;
++	uint32_t const *val;
++	unsigned int size;
++	uint32_t draw_secs = 15;
++	PE_parse_boot_argn("lisa_fbcon_secs", &draw_secs, sizeof(draw_secs));
++	fbcon_draw_until = mach_absolute_time() + (uint64_t)draw_secs * 19200000ULL;
++
++	if (SecureDTFindEntry("name", "sweet-fbcon", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		return false;
++	}
++	if (SecureDTGetProperty(entry, "width", (void const **)&val, &size) == kSuccess) {
++		fbcon_width = *val;
++	}
++	if (SecureDTGetProperty(entry, "height", (void const **)&val, &size) == kSuccess) {
++		fbcon_height = *val;
++	}
++	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
++		fbcon_stride = *val;
++	}
++	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
++		return false;
++	}
++	{
++		volatile uint8_t *ring = (volatile uint8_t *)ml_io_map_wcomb(LISA_RING_PA, LISA_RING_SIZE);
++		if (ring != NULL) {
++			lisa_ring_begin(ring, false);
++		}
++	}
++	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
++	if (fbcon_base == NULL) {
++		return false;
++	}
++	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
++	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
++	for (uint32_t r = 0; r < fbcon_rows; r++) {
++		fbcon_clear_row(r);
++	}
++	for (const char *s = "lisa: xnu-12377 fbcon up\n"; *s != '\0'; s++) {
++		fbcon_transmit_data((uint8_t)*s);
++	}
++	return true;
++}
++#endif /* XNU_ARM_DT_PLATFORM */
++
+ int
+ serial_init(void)
+ {
+@@ -917,6 +1250,14 @@ serial_init(void)
+ 		return gPESF != NULL;
+ 	}
+ 
++#if defined(XNU_ARM_DT_PLATFORM) && XNU_ARM_DT_PLATFORM
++	if (fbcon_probe()) {
++		register_serial_functions(&fbcon_functions);
++		uart_initted = true;
++		return 1;
++	}
++#endif
++
+ #if XNU_NATIVE_DWC3_CONSOLE
+ 	if (unixnu_dwc3_init()) {
+ 		register_serial_functions(&unixnu_dwc3_functions);
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -121,7 +121,8 @@
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 16)
+ #else /* defined(ARM_LARGE_MEMORY) */
+-#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
++/* Lisa: V=P and kernel maps of a 4 GiB window plus the framebuffer and ramoops maps; start.s does not check this. */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 24)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+ 
+ typedef uint64_t tt_entry_t; /* translation table entry type */

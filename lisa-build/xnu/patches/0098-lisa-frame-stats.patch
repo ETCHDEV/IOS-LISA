@@ -1,0 +1,62 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -288,6 +288,11 @@
+ 
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
++static uint64_t lisa_fb_presents, lisa_fb_copied, lisa_fb_default;
++
++extern "C" uint64_t lisa_fb_present_count(void) { return __atomic_load_n(&lisa_fb_presents, __ATOMIC_RELAXED); }
++extern "C" uint64_t lisa_fb_copy_count(void) { return __atomic_load_n(&lisa_fb_copied, __ATOMIC_RELAXED); }
++extern "C" uint64_t lisa_fb_default_count(void) { return __atomic_load_n(&lisa_fb_default, __ATOMIC_RELAXED); }
+ 
+ extern "C" uint64_t lisa_fb_swap_count(void)
+ {
+@@ -318,6 +323,7 @@
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	__atomic_add_fetch(&lisa_fb_presents, 1, __ATOMIC_RELAXED);
+ 
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+@@ -340,6 +346,7 @@
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+ 		if (s == NULL || s == fSurface) {
++			if (s == fSurface) __atomic_add_fetch(&lisa_fb_default, 1, __ATOMIC_RELAXED);
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+@@ -387,6 +394,7 @@
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			__atomic_add_fetch(&lisa_fb_copied, 1, __ATOMIC_RELAXED);
+ 			/* Keep diagnostics visible until a real, validated layer is ready. */
+ 			if (!fConsolePaused) {
+ 				int quiet = 0;
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -89,6 +89,9 @@
+ 
+ /* Low-volume opt-in boot status. Counts processes, not their health. */
+ extern uint64_t lisa_fb_swap_count(void);
++extern uint64_t lisa_fb_present_count(void);
++extern uint64_t lisa_fb_copy_count(void);
++extern uint64_t lisa_fb_default_count(void);
+ void lisa_status_start(void);
+ struct lisa_status_counts { unsigned springboard, backboard, migration; };
+ static int
+@@ -110,8 +113,9 @@
+         (void)tsleep(&chan, PZERO, "lisastat", 30 * hz);
+         struct lisa_status_counts c = {0};
+         proc_iterate(PROC_ALLPROCLIST, lisa_status_proc, &c, NULL, NULL);
+-        printf("LISA STATUS: SpringBoard %u backboardd %u migration %u swaps %llu\n",
+-            c.springboard, c.backboard, c.migration, lisa_fb_swap_count());
++        printf("LISA STATUS: SB %u BB %u DM %u swaps %llu present %llu copy %llu default %llu\n",
++            c.springboard, c.backboard, c.migration, lisa_fb_swap_count(),
++            lisa_fb_present_count(), lisa_fb_copy_count(), lisa_fb_default_count());
+     }
+ }
+ void

@@ -1,0 +1,76 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -832,6 +832,42 @@
+ 	uint32_t cfg = pull | function << 2 | (drive / 2 - 1) << 6 | (output ? 1u << 9 : 0);
+ 	if (output) touch_wr(lisa_hw.tlmm, pin * 0x1000u + 4u, high ? 2u : 0u);
+ 	touch_wr(lisa_hw.tlmm, pin * 0x1000u, cfg);
++}
++/* Software SPI is a bounded fallback when the inherited QUP clock cannot be
++ * enabled.  It uses only the four touchscreen pins and the existing worker. */
++static unsigned lisa_spi_input = 52, lisa_spi_output = 53;
++static void lisa_pin_set(unsigned pin, bool high)
++{
++	touch_wr(lisa_hw.tlmm, pin * 0x1000u + 4u, high ? 2u : 0u);
++}
++static int lisa_gpio_spi_exchange(void *unused, const uint8_t *tx, uint8_t *rx, size_t length)
++{
++	(void)unused;
++	if (!tx || !length || length > 1033) return -1;
++	lisa_pin_set(55, false);
++	for (size_t i = 0; i < length; ++i) {
++		uint8_t in = 0;
++		for (int bit = 7; bit >= 0; --bit) {
++			lisa_pin_set(lisa_spi_output, (tx[i] >> bit) & 1);
++			delay(1);
++			lisa_pin_set(54, true);
++			delay(1);
++			in = (uint8_t)((in << 1) | (touch_rd(lisa_hw.tlmm, lisa_spi_input * 0x1000u + 4u) & 1));
++			lisa_pin_set(54, false);
++		}
++		if (rx) rx[i] = in;
++	}
++	lisa_pin_set(55, true);
++	return 0;
++}
++static void lisa_gpio_spi_init(unsigned input)
++{
++	lisa_spi_input = input;
++	lisa_spi_output = input == 52 ? 53 : 52;
++	lisa_gpio(55, 0, 0, 6, true, true);
++	lisa_gpio(54, 0, 0, 6, true, false);
++	lisa_gpio(lisa_spi_output, 0, 0, 6, true, false);
++	lisa_gpio(lisa_spi_input, 0, 0, 2, false, false);
+ }
+ static uint32_t lisa_clock_rate(uint32_t cfg, uint32_t m, uint32_t inverse_n)
+ {
+@@ -888,12 +924,24 @@
+ 	lisa_gpio(105, 0, 3, 8, true, true);
+ 	touch_wait(100);
+ 	uint32_t rate, selection;
+-	if (!lisa_touch_clocks(&rate, &selection)) { printf("LISA TOUCH: clocks unavailable\n"); goto out; }
+-	for (unsigned pin = 52; pin <= 55; ++pin) lisa_gpio(pin, 1, 0, 6, false, false);
+-	lisa_hw.geni = (struct lisa_geni_spi){&lisa_hw, lisa_se_read, lisa_se_write, lisa_delay, 0};
+-	if (lisa_geni_spi_init(&lisa_hw.geni, rate, selection, 1000000)) { printf("LISA TOUCH: GENI SPI unavailable\n"); goto out; }
+-	lisa_hw.bus = (struct lisa_goodix_spi_bus){&lisa_hw.geni, lisa_geni_spi_exchange, 0};
+-	if (lisa_goodix_spi_discover(&lisa_hw.bus)) { printf("LISA TOUCH: GT9897 IC info invalid\n"); goto out; }
++	bool found = false;
++	if (lisa_touch_clocks(&rate, &selection)) {
++		for (unsigned pin = 52; pin <= 55; ++pin) lisa_gpio(pin, 1, 0, 6, false, false);
++		lisa_hw.geni = (struct lisa_geni_spi){&lisa_hw, lisa_se_read, lisa_se_write, lisa_delay, 0};
++		if (!lisa_geni_spi_init(&lisa_hw.geni, rate, selection, 1000000)) {
++			lisa_hw.bus = (struct lisa_goodix_spi_bus){&lisa_hw.geni, lisa_geni_spi_exchange, 0};
++			found = !lisa_goodix_spi_discover(&lisa_hw.bus);
++		}
++	} else printf("LISA TOUCH: clocks unavailable, trying GPIO SPI\n");
++	if (!found) {
++		lisa_hw.bus = (struct lisa_goodix_spi_bus){NULL, lisa_gpio_spi_exchange, 0};
++		/* Do not swap input and output: driving the controller's output
++		 * could cause contention.  These are the QUP1 SE5 pin roles. */
++		lisa_gpio_spi_init(52);
++		found = !lisa_goodix_spi_discover(&lisa_hw.bus);
++		printf("LISA TOUCH: GPIO SPI input 52 %s\n", found ? "identified" : "no valid IC info");
++	}
++	if (!found) goto out;
+ 	printf("LISA TOUCH: GT9897 event register %#x\n", lisa_hw.bus.event_address);
+ 	for (unsigned errors = 0;;) {
+ 		int r = lisa_goodix_poll(&lisa_hw.bus, lisa_hw.bus.event_address, lisa_goodix_spi_read, lisa_goodix_spi_ack);

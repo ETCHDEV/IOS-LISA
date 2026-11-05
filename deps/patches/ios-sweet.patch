@@ -1,0 +1,70 @@
+diff --git a/NOTES.md b/NOTES.md
+index 4ba65ad..4390dd7 100644
+--- a/NOTES.md
++++ b/NOTES.md
+@@ -1,5 +1,65 @@
+ # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
+ 
++## Lisa XNU device attempt (2026-10-20)
++
++User explicitly accepted remaining hardware risk. Temporary boot of ../lisa-tools/diagnostic/out-xnu/lisa-xnu-v3.img (SHA-256 f8a7c5f31744afaa06dee926912748a464a8e5fa1f9ccf3025d4da6a1464b062) reached an XNU panic, photographed on a repeat boot: undefined instruction d51be228 at 0xfffffe000748a1e4, identified as msr CNTP_CTL_EL0 in fiq_context_init. Android returned; rooted pstore empty. Patch 0084 (lisa-build commit 8ef0e79) omits the physical timer write, retains the virtual timer, and was rebuilt locally (kernel SHA-256 99a184c1ca939c934fbe8cb38e21f632864f57d6c66a1c0ae8592958d43e1361). Host payload tests passed and Sweet QEMU reached CPU/platform/framebuffer initialization (incomplete decode). Temporary boot of updated image SHA-256 17b7bd1bd40f107c7fa221d245ad186e287d85d27b172359bf63439068fa21fd reached platform expert, single CPU, framebuffer, VM bootstrap and ATM initialization, shown in user's photo. User rebooted to Android; ADB detected Lisa. No iOS root or partition flash. USB logging remains unavailable: Lisa has a different USB2 PHY and an IOMMU; see ../lisa-tools/USB-LOGGING.md. RAM safety and remaining MMIO are not fully verified, and no automatic reset is guaranteed after XNU entry. Details in ../LISA-BRINGUP.md.
++
++2026-10-21: temporary read-only UFS status probe image SHA-256 fadd50d27f22305f014b71fa9634dcc509acc7d13dfda180cbb636825050c440 showed CAP 0x1587031f, HCS 0x10f, HCE 1, transfer doorbell 0 (user photo); Android subsequently appeared over ADB. No UFS commands or storage writes were issued. This does not establish safe DMA through Lisa's IOMMU. The live FDT reserves 2 MiB ramoops pmsg at 0xa9000000, but survival across this boot path and ownership are unverified; do not write there yet. See ../LISA-BRINGUP.md.
++
++2026-10-21: user authorized UFS writes and erasing userdata if needed, but no iOS root image is present and UFS DMA remains unvalidated. No storage was written. A temporary 0084 XNU image with a static test init RAM disk was built and host-validated; image SHA-256 981ac785f6aa4f3745dddf0bb580c1057774edf9795de797eecd7658c59fc96a. On Lisa the user reported a stall after a subsystem initialization line; Android then returned. QEMU reached md0 and test init PID 1. A second image adds startup_debug=1, SHA-256 8ef10cecb55100b5e435ffca1ed0336bfb625c14377c4c03bde7ed6d1fffa56d; product lisa confirmed and fastboot boot OKAY, screen result pending. User reconnects USB after switching between ADB and fastboot. See ../LISA-BRINGUP.md.
++
++User's verbose boot photo shows 1/1 CPU initialized with SGI verified and kernel_do_post done; no test PID 1 observed. Lisa's FDT reports eight PSCI CPUs with MPIDRs 0x000..0x700 and distinct capacity/frequency domains. Updated ../lisa-tools/mk-lisa-adt.py with FDT-validated --cpus selection. Two-CPU test image SHA-256 5c7b976b53809e456117198491a3d0554900080f3f35eeeef77dfc0f4591fb7c passed host payload checks and fastboot boot returned OKAY on product lisa; photo/result pending. Current scheduling topology and clock properties are inherited approximations; no all-core validation or UFS writes. See ../LISA-BRINGUP.md.
++
++User's two-core photo showed PSCI CPU_ON target 0x100 success, CPU1 online, and CPU1 entered initCPU (IRQs masked at that stage, expected); it did not show SGI1 OK or 2/2. ADB later detected Android. A less verbose two-core repeat (SHA-256 4530c60506f8930f1c51a0a34aae51c6c516e43247b4ea705bc37f4c22d5e46a) passed validation, product lisa was confirmed, and fastboot boot returned OKAY. User is taking a photo after waiting; result pending. No UFS writes.
++
++Repeat photo again lacked CPU1 SGI confirmation. Built 0085 CPU trace locally (kernel SHA-256 5842351e585f4746fc6ac5f2cb7d0d2c5acd04c77791acd3b0bf43e80cc21dd4); temporary image SHA-256 edd79b2b164457134aeddec956c7c8a7b699a37b1d356fe2475aa447a29e4d2a passed host checks and fastboot boot returned OKAY; screen photo pending. Apple iPhone X iOS 16.7.16 IPSW downloaded and checksum-verified under ../lisa-tools/ios-artifacts, selected extracted members match manifest hashes. macOS attached all three source volumes read-only and later detached them; ownership interpretation was disabled and enabling it requires administrator authorization. No iOS root built or flashed. Details in ../LISA-BRINGUP.md.
++
++## Lisa live payload preflight (2026-10-20)
++
++Temporarily booted ../lisa-tools/diagnostic/out-preflight/lisa-preflight-v3.img (SHA-256 c83dd06efd12be39772a8b68db84db26d041b4b0b806f7f19f0a72ddcf37f8ad). User saw PREFLIGHT PASSED; ADB subsequently observed Android boot completed. This validated actual initrd framing and payload structure without copying to candidate upper RAM or jumping to XNU. It does not prove the destination safe from firmware/DMA, verify GIC behavior, or guarantee recovery after XNU entry. No XNU boot and no partition flash. See ../LISA-BRINGUP.md.
++
++## Lisa battery guard and bounded FDT reader (2026-10-20)
++
++Locally applied and rebuilt patch 0083 (lisa-build commit b60cbdc) to keep SweetBattery in static fallback, regardless of boot args; current kernel SHA-256 d8768bf176adfe0dcf423c2b3da166c6d7e59909464545087fb9d64c7a466985. Object no longer references sweet_spmi_init, though sweet_spmi_read remains in other functions. QEMU snapshot showed fallback, CPU and framebuffer initialization, with no panic observed; this is not a completed or Lisa boot. Candidate payload passed offline structural tests. Added host-tested bounded FDT /chosen reader, compiled for AArch64, not integrated into a loader. The kernel also programs GIC registers, requiring Lisa audit. Memory ownership, live checks and recovery remain unresolved; XNU was not booted on Lisa. See ../LISA-BRINGUP.md.
++
++## Lisa local-only build update (2026-10-20)
++
++Full kernel compiled and linked locally after Xcode first-launch setup and extracting KDK 13.5 into the workspace. Xcode 27-generated iig sources were ABI-incompatible; reused 34 generated source/header pairs from the earlier build after verifying the 17 interface inputs were identical. Local kernel hash 4206ab40bfa7714c9a7001c7399c4da0b1d1910c35753c4a7987eb8ab4800186. QEMU reached CPU/platform/framebuffer initialization, incomplete snapshot only. Candidate Lisa payload passed offline structural checks; no XNU device boot. See ../LISA-BRINGUP.md for artifact paths and limitations.
++
++User requested all future builds on this Mac, without GitHub workflows. A locally compiled, host-tested standalone runtime payload bounds validator now lives in ../lisa-tools/diagnostic; it is not integrated into a booting loader. Rooted Android /proc/iomem lists the proposed upper range as System RAM without a reservation inside it, but does not establish firmware safety. XNU has not been booted on Lisa. SweetBattery has a separate SPMI path gated by sweetbattery=1, independent of the UFS guard; keep it disabled and audit remaining hardware paths. See ../LISA-BRINGUP.md for details and current limits.
++
++## Lisa timed diagnostic (2026-10-20)
++
++Built ../lisa-tools/diagnostic/out/lisa-diagnostic-timeout-v3.img SHA-256 c264aee691ea9c894ff2e72b8fa7b2d8b03dfb653a718c3f9454f9901f68f77f, verified kernel/ramdisk against inputs. Temporarily booted with fastboot boot (send and boot OKAY); user observed diagnostic text and an automatic reboot around 30 seconds, followed by Android lock/home screen. ADB did not yet reappear after reboot. Normal timeout and PSCI reset worked once; exception path untested. No partition flashed, no UFS or PMIC driver used. USB live logging remains unimplemented; live tree DWC3 base 0x0a600000 matches Sweet, not evidence of safe initialization. Do not use Sweet persistent logging: it writes to userdata and could corrupt Android data.
++
++## Lisa first diagnostic observation (2026-10-20)
++
++User observed diagnostic text following temporary v3 `fastboot boot` and transcribed: FDT 0x00000000ae94b000, CurrentEL 0x4 (EL1), SCTLR_EL1 0x30d00808 (MMU, data cache and instruction cache disabled), MPIDR_EL1 0x81000000, ID_AA64MMFR0_EL1 0x101122 (16 KiB granule field 1, 4 KiB field 0, PARange field 2), ID_AA64PFR0_EL1 0x11112222, CNTFRQ_EL0 0x124f800 (19.2 MHz). Screen output establishes that our display writes were visible in this boot, not a complete framebuffer or memory safety proof. User restarted into Android; adb independently observed LineageOS, slot a, verified boot orange. No partition flashed. Diagnostic has no thermal management and must not be left running. Future iterations should provide a bounded, tested exit before another boot. XNU has not booted.
++
++## Lisa temporary diagnostic boot (2026-10-20)
++
++Built v3 temporary boot image ../lisa-tools/diagnostic/out/lisa-diagnostic-v3.img, sha256 3621793aaa4375e65456b29cdd90c27f06a3414b39f06e8c0c19dbe5bee551f1. Kernel and copied v3 ramdisk verified byte-for-byte. adb reboot bootloader, then fastboot boot returned Sending OKAY and Booting OKAY; no partition flashed. Screen outcome pending user observation; neither adb nor fastboot detected immediately afterward. Image touches candidate splash framebuffer and CPU registers only, no UFS/PMIC or peripheral register access; handoff assumptions unverified.
++
++## Lisa diagnostic preparation (2026-10-20)
++
++Vendor bundle entries 11 and 13 match live qcom,msm-id; board/overlay selection still unverified. Experimental framebuffer-only diagnostic source and build at ../lisa-tools/diagnostic; ARM64 ELF/Image built with LLVM/lld, linked ELF has no remaining relocations, Image header size matches file. No boot image made or booted; ABL framebuffer and entry assumptions unverified. Details in ../LISA-BRINGUP.md.
++
++## Lisa vendor boot update (2026-10-20)
++
++Saved and SHA-256 verified active LineageOS vendor_boot_a. Vendor boot header v3, 4096-byte page, DTB section 8000046 bytes extracted to dtb/lisa-vendor-dtb.bin. First DTB identifies KATMAI-FP2, not Lisa: determine matching entry and overlays before use. No image built or booted.
++
++## Lisa rooted-device update (2026-10-20)
++
++Rooted ADB collected dtb/lisa-live.dtb and active LineageOS boot_a, dtbo_a, vbmeta_a backups under backup/; SHA-256 matched the phone for all three. Boot header v3; v2 unpacker failed and is unsuitable. Live tree has splash 0xe1000000, GIC 0x17a00000/0x17a60000, UFS 0x1d84000 and PSCI SMC. Sweet low RAM range crosses Lisa reservations and a bank gap. See ../LISA-BRINGUP.md. No shim built or booted, no device writes.
++
++## Lisa connected-device update (2026-10-20)
++
++ADB detected Lisa 2109119DI, LineageOS 23.2-20260929-NIGHTLY-lisa, Android 16, verified boot orange, active slot a. Live device-tree properties and boot partitions are inaccessible to shell. No partition read or write performed. Offline raw FDT inspector at ../lisa-tools/inspect-dtb.py; synthetic parsing checks passed. Await root or compatible temporary recovery to collect target artifacts. No diagnostic image built.
++
++## Lisa assessment (2026-10-20)
++
++Cloned upstream at 11da58bd050672960c0a83b5bef2176047eea479 for Lisa port research. See ../LISA-BRINGUP.md for hardware comparison and unverified assumptions. No Lisa image was built or booted. Repository validation passed with PYTHONPYCACHEPREFIX=/private/tmp/ios-lisa-pycache. Lisa stock boot artifacts, live memory map, and device access are still needed.
++
+ ## Agent handoff / active work (2026-10-15, latest)
+ 
+ ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

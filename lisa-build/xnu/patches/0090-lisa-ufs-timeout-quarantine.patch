@@ -1,0 +1,34 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -109,6 +109,7 @@
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
++	bool faulted;                           /* timed-out DMA: never reuse slot or buffers */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -148,6 +149,12 @@
+ static int
+ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
++	/* A timeout can leave the controller owning the descriptor and bounce
++	 * buffer even after UTRLCLR. Do not touch either again without a full,
++	 * verified controller recovery, which this driver does not implement. */
++	if (su.faulted) {
++		return EIO;
++	}
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
+@@ -219,8 +226,9 @@
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
++			su.faulted = true;
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++			printf("LISA UFS: command 0x%02x timed out; controller quarantined\n", cdb[0]);
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {

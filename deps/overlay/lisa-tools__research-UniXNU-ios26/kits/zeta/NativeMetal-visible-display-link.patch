@@ -1,0 +1,166 @@
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -8,6 +8,8 @@
+ // gets its own native device (its own driver connection, GPU address window and shader cache) when its name is listed in the file
+ // NativeAdrenoMetal.clients beside the bundle ("*" lists every process); an unlisted one returns nil and keeps the software renderer.
+ #import <Foundation/Foundation.h>
++#import <objc/runtime.h>
++#include <atomic>
+ #include <pthread.h>
+ #include <dlfcn.h>
+ #include <unistd.h>
+@@ -164,12 +166,139 @@
+         streamText(*gpu, text);
+     }
+ }
++// How far a client's CAMetalDisplayLinks get (Setup's hello is one: HelloView, metalDisplayLink:needsUpdate:, on a CAMetalLayer), for its status
++// line: links made, added to a run loop, paused/resumed, the preferred frame latency, the delegate's updates, nextDrawable calls (nil ones),
++// drawables presented and presented feedback (setPresentedTime:). Counters only; every call goes on to the original.
++static std::atomic<unsigned> gLinks, gLinkRuns, gLinkPauses, gLinkResumes, gLinkUpdates, gNextDrawables, gNilDrawables, gPresents, gPresented;
++static std::atomic<int> gLinkLatency{-1};
++static char gLinkDelegate[24];
++static void replaceMethod(Class c, const char *name, id (^make)(IMP original, SEL selector)) {
++    const SEL selector = sel_registerName(name);
++    Method method = c ? class_getInstanceMethod(c, selector) : nullptr;
++    if (method) method_setImplementation(method, imp_implementationWithBlock(make(method_getImplementation(method), selector)));
++}
++// The hello view itself (the last one laid out, else the first one found in the app's windows) and what Setup's main queue saw at the last
++// tick: layouts, main-queue runs, windows and views, whether a hello view exists, the last characters of the key window's root and top view
++// controllers' classes, and the hello view's window, hidden, alpha (percent), width x height, its displayLink and isPaused stored properties,
++// the link's paused state and delegate.
++static __weak id gHello;
++static std::atomic<unsigned> gHelloLayouts, gMainRuns;
++static char gHelloState[200] = "-";
++static void countHelloLayouts() {
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        replaceMethod((Class)objc_getClass("_TtC23SetupAssistantSupportUI9HelloView"), "layoutSubviews", ^id(IMP original, SEL selector) {
++            return ^(id self) {++gHelloLayouts; gHello = self; ((void (*)(id, SEL))original)(self, selector);};
++        });
++    });
++}
++static id send(id object, const char *name) {return object ? ((id (*)(id, SEL))objc_msgSend)(object, sel_registerName(name)) : nil;}
++static id findView(id view, Class wanted, unsigned depth, unsigned &views) {
++    ++views;
++    if (wanted && [view isKindOfClass:wanted]) return view;
++    id found = nil;
++    if (depth < 48) for (id subview in send(view, "subviews")) if (id inner = findView(subview, wanted, depth + 1, views)) found = found ?: inner;
++    return found;
++}
++static const char *classTail(id object) {
++    if (!object) return "-";
++    const char *name = class_getName(object_getClass(object));
++    const size_t length = strlen(name);
++    return name + (length > 28 ? length - 28 : 0);
++}
++static void readHello() {
++    dispatch_async(dispatch_get_main_queue(), ^{
++        ++gMainRuns;
++        unsigned windows = 0, views = 0;
++        id found = nil, key = nil;
++        Class wanted = (Class)objc_getClass("_TtC23SetupAssistantSupportUI9HelloView");
++        for (id scene in send(send((id)objc_getClass("UIApplication"), "sharedApplication"), "connectedScenes")) {
++            if (![scene respondsToSelector:sel_registerName("windows")]) continue;
++            for (id window in send(scene, "windows")) {
++                ++windows;
++                if (((BOOL (*)(id, SEL))objc_msgSend)(window, sel_registerName("isKeyWindow"))) key = window;
++                if (id inner = findView(window, wanted, 0, views)) found = found ?: inner;
++            }
++        }
++        id top = send(key, "rootViewController");
++        // down through presented controllers and navigation stacks to the screen being shown
++        for (unsigned i = 0; i < 16; ++i) {
++            if (id presented = send(top, "presentedViewController")) top = presented;
++            else if ([top respondsToSelector:sel_registerName("topViewController")] && send(top, "topViewController")) top = send(top, "topViewController");
++            else break;
++        }
++        id hello = gHello ?: found;
++        int used = snprintf(gHelloState, sizeof gHelloState, "W%u V%u f%d root %s top %s", windows, views, found != nil,
++                            classTail(send(key, "rootViewController")), classTail(top));
++        if (!hello) return;
++        Ivar linkIvar = class_getInstanceVariable(object_getClass(hello), "displayLink");
++        Ivar pausedIvar = class_getInstanceVariable(object_getClass(hello), "isPaused");
++        id link = linkIvar ? object_getIvar(hello, linkIvar) : nil;
++        const int paused = pausedIvar ? *((const uint8_t *)(__bridge void *)hello + ivar_getOffset(pausedIvar)) : -1;
++        const CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(hello, sel_registerName("bounds"));
++        id window = ((id (*)(id, SEL))objc_msgSend)(hello, sel_registerName("window"));
++        const BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(hello, sel_registerName("isHidden"));
++        const double alpha = ((double (*)(id, SEL))objc_msgSend)(hello, sel_registerName("alpha"));
++        const int linkPaused = link ? ((BOOL (*)(id, SEL))objc_msgSend)(link, sel_registerName("isPaused")) : -1;
++        const int linkDelegate = link ? ((id (*)(id, SEL))objc_msgSend)(link, sel_registerName("delegate")) == hello : -1;
++        snprintf(gHelloState + used, sizeof gHelloState - used, " w%d h%d a%d %dx%d k%d i%d kp%d kd%d", window != nil, hidden, int(alpha * 100),
++                 int(bounds.size.width), int(bounds.size.height), link != nil, paused, linkPaused, linkDelegate);
++    });
++}
++static void countDelegateUpdates(Class c) {
++    static Class counted[4];
++    static unsigned used;
++    @synchronized([NSObject class]) {
++        for (unsigned i = 0; i < used; ++i) if (counted[i] == c) return;
++        if (!c || used == 4 || !class_getInstanceMethod(c, sel_registerName("metalDisplayLink:needsUpdate:"))) return;
++        counted[used++] = c;
++        const char *name = class_getName(c);
++        const size_t length = strlen(name);
++        strlcpy(gLinkDelegate, name + (length > sizeof gLinkDelegate - 1 ? length - (sizeof gLinkDelegate - 1) : 0), sizeof gLinkDelegate);
++    }
++    replaceMethod(c, "metalDisplayLink:needsUpdate:", ^id(IMP original, SEL selector) {
++        return ^(id self, id link, id update) {++gLinkUpdates; ((void (*)(id, SEL, id, id))original)(self, selector, link, update);};
++    });
++}
++static void countDisplayLinks() {
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        Class link = (Class)objc_getClass("CAMetalDisplayLink");
++        replaceMethod(link, "initWithMetalLayer:", ^id(IMP original, SEL selector) {
++            return ^id(id self, id layer) {++gLinks; return ((id (*)(id, SEL, id))original)(self, selector, layer);};
++        });
++        replaceMethod(link, "addToRunLoop:forMode:", ^id(IMP original, SEL selector) {
++            return ^(id self, id loop, id mode) {++gLinkRuns; ((void (*)(id, SEL, id, id))original)(self, selector, loop, mode);};
++        });
++        replaceMethod(link, "setPaused:", ^id(IMP original, SEL selector) {
++            return ^(id self, BOOL paused) {++(paused ? gLinkPauses : gLinkResumes); ((void (*)(id, SEL, BOOL))original)(self, selector, paused);};
++        });
++        replaceMethod(link, "setPreferredFrameLatency:", ^id(IMP original, SEL selector) {
++            return ^(id self, float latency) {gLinkLatency = int(latency); ((void (*)(id, SEL, float))original)(self, selector, latency);};
++        });
++        replaceMethod(link, "setDelegate:", ^id(IMP original, SEL selector) {
++            return ^(id self, id delegate) {countDelegateUpdates(object_getClass(delegate)); ((void (*)(id, SEL, id))original)(self, selector, delegate);};
++        });
++        replaceMethod((Class)objc_getClass("CAMetalLayer"), "nextDrawable", ^id(IMP original, SEL selector) {
++            return ^id(id self) {++gNextDrawables; id drawable = ((id (*)(id, SEL))original)(self, selector); if (!drawable) ++gNilDrawables; return drawable;};
++        });
++        Class drawable = (Class)objc_getClass("CAMetalDrawable");
++        replaceMethod(drawable, "present", ^id(IMP original, SEL selector) {
++            return ^(id self) {++gPresents; ((void (*)(id, SEL))original)(self, selector);};
++        });
++        replaceMethod(drawable, "setPresentedTime:", ^id(IMP original, SEL selector) {
++            return ^(id self, double time) {++gPresented; ((void (*)(id, SEL, double))original)(self, selector, time);};
++        });
++    });
++}
+ // A listed client's own frontend status (the render server's comes through its telemetry): when it changed, every five seconds, the
+ // status line (counters, then the last two problems) in pieces "C<n> <57 characters>" on the marker stream, which the kernel keeps
+ // as the client line. The pieces go 1.5 s apart: the kernel's printer reads the line once a second.
+ static void clientStatus(unsigned port) {
+     Gpu *gpu = makeGpu(port);
+     if (!gpu) return;
++    countDisplayLinks();
++    countHelloLayouts();
+     pthread_attr_t attributes;
+     pthread_attr_init(&attributes);
+     pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+@@ -179,7 +308,13 @@
+         static char full[420], last[420];
+         for (;;) {
+             sleep(5);
+-            native_bridge_metal_status(full, sizeof full);
++            // the hello's delegate when its link was made before these counters were in place
++            countDelegateUpdates((Class)objc_getClass("_TtC23SetupAssistantSupportUI9HelloView"));
++            readHello();
++            const int used = snprintf(full, sizeof full, "L%u r%u p%u/%u f%d u%u n%u/%u q%u y%u H%u m%u %s || ", gLinks.load(), gLinkRuns.load(),
++                gLinkPauses.load(), gLinkResumes.load(), gLinkLatency.load(), gLinkUpdates.load(), gNextDrawables.load(), gNilDrawables.load(),
++                gPresents.load(), gPresented.load(), gHelloLayouts.load(), gMainRuns.load(), gHelloState);
++            native_bridge_metal_status(full + used, sizeof full - used);
+             if (!strcmp(full, last)) continue;
+             strlcpy(last, full, sizeof last);
+             const size_t length = strlen(full);

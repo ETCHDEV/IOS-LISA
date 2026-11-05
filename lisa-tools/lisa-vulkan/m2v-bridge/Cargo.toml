@@ -1,0 +1,17 @@
+[package]
+name = "adreno-metal-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+[workspace]
+[lib]
+crate-type = ["staticlib"]
+path = "/Users/arjun/IOS-LISA/lisa-tools/research-UniXNU-AdrenoMetal/bridge/NativeMetalBridge.rs"
+[dependencies]
+metal2vulkan = { path = "/Users/arjun/IOS-LISA/lisa-tools/research-metal2vulkan/crates/metal2vulkan", features = ["ash"] }
+metal2vulkan-runtime = { path = "/Users/arjun/IOS-LISA/lisa-tools/research-metal2vulkan/crates/metal2vulkan-runtime" }
+libc = "0.2"
+sha2 = { version = "0.10" }
+[profile.release]
+panic = "unwind"
+debug = 1

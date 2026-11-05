@@ -1,0 +1,102 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8132,6 +8132,23 @@
+ 	native_gpu_addon_mount(p, scratch, 0x600, daemons_source, sizeof(daemons_source), daemons_point, sizeof(daemons_point),
+ 	    "/System/Library/LaunchDaemons/com.apple.backboardd.plist",
+ 	    "/System/Library/LaunchDaemons/org.blu-sharky.adrenoprobed.plist", &native_gpu_addon2_stage, &native_gpu_addon2_status);
++}
++
++/* Lisa: the preinstalled apps stay in the OS volume's /private/var/staged_system_apps (no restore moved them). The Data
++ * mount covers that path, so before it they get a read-only union view over /Applications. boot-arg lisa-apps=1. */
++volatile int lisa_apps_stage = 0, lisa_apps_status = -1;
++static void
++lisa_apps_prepare(proc_t p, user_addr_t scratch)
++{
++	uint32_t enabled = 0;
++	if (!PE_parse_boot_argn("lisa-apps", &enabled, sizeof(enabled)) || enabled != 1) {
++		return;
++	}
++	static const char source[] = "/private/var/staged_system_apps", point[] = "/Applications";
++	native_gpu_addon_mount(p, scratch, 0x800, source, sizeof(source), point, sizeof(point),
++	    "/Applications/Preferences.app/Info.plist", "/Applications/Calculator.app/Info.plist",
++	    &lisa_apps_stage, &lisa_apps_status);
++	printf("LISA APPS: union over /Applications stage %d status %d\n", lisa_apps_stage, lisa_apps_status);
+ }
+ 
+ static int
+@@ -8151,6 +8168,7 @@
+ 	native_owner_data_seed_base = base;
+ 	native_owner_data_seed_size = size;
+ 	native_owner_data_stage = 1;
++	lisa_apps_prepare(p, scratch);
+ 	strlcpy(native_owner_data_device_path, device_path, sizeof(native_owner_data_device_path));
+ 	uint8_t payload[0x150] = {0};
+ 	user64_addr_t spec = scratch + 0x160;
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -697,9 +697,49 @@
+ 	return writev_internal(p, fd, uio, flags, puguard, retval);
+ }
+ 
++/* Lisa: what iOS processes write to stderr (OS_ACTIVITY_DT_MODE=1 sends their os_log there), filtered, in the console log.
++ * boot-arg lisa-stderr=1. Bounded: one line 300 bytes, 1.5 MiB a boot. */
++extern boolean_t PE_parse_boot_argn(const char *arg_string, void *arg_ptr, int max_arg);
++static void
++lisa_stderr_capture(struct proc *p, user_addr_t buffer, size_t length)
++{
++	static int enabled = -1;
++	static uint64_t total;
++	static const char * const keys[] = {"tatusBar", "ackgroundActivity", "ystemStatus", "rror", "ault", "oster",
++		"allpaper", "ecording", "mergency", "ensorActivity", "abort", "rash"};
++	char line[301];
++	bool wanted = false;
++
++	if (enabled < 0) {
++		int on = 0;
++		PE_parse_boot_argn("lisa-stderr", &on, sizeof(on));
++		enabled = on == 1;
++	}
++	if (enabled != 1 || length == 0 || total > 0x180000) {
++		return;
++	}
++	size_t n = MIN(length, sizeof(line) - 1);
++	if (copyin(buffer, line, n)) {
++		return;
++	}
++	line[n] = 0;
++	for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
++		wanted = wanted || strnstr(line, keys[k], n) != NULL;
++	}
++	static int lisa_first;
++	if (!wanted && lisa_first++ >= 30) {
++		return;
++	}
++	total += n;
++	printf("ios %s: %s\n", p->p_comm, line);
++}
++
+ int
+ write_nocancel(struct proc *p, struct write_nocancel_args *uap, user_ssize_t *retval)
+ {
++	if (uap->fd == 2) {
++		lisa_stderr_capture(p, uap->cbuf, uap->nbyte);
++	}
+ 	return write_internal(p, uap->fd, uap->cbuf, uap->nbyte, (off_t)-1, 0,
+ 	           NULL, retval);
+ }
+@@ -797,6 +835,15 @@
+ int
+ writev_nocancel(struct proc *p, struct writev_nocancel_args *uap, user_ssize_t *retval)
+ {
++	if (uap->fd == 2 && uap->iovcnt > 0 && IS_64BIT_PROCESS(p)) {
++		struct user64_iovec lisa_iov[4];
++		u_int lisa_count = MIN((u_int)uap->iovcnt, 4u);
++		if (!copyin(uap->iovp, lisa_iov, lisa_count * sizeof(lisa_iov[0]))) {
++			for (u_int lisa_i = 0; lisa_i < lisa_count; lisa_i++) {
++				lisa_stderr_capture(p, (user_addr_t)lisa_iov[lisa_i].iov_base, (size_t)lisa_iov[lisa_i].iov_len);
++			}
++		}
++	}
+ 	return writev_uio(p, uap->fd, uap->iovp, uap->iovcnt, 0, 0, NULL, retval);
+ }
+ 

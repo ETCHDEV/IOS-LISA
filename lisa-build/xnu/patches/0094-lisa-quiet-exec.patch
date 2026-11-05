@@ -1,0 +1,24 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -194,6 +194,9 @@
+ 
+ #if DEBUG || DEVELOPMENT
+ static TUNABLE(bool, unentitled_ios_sim_launch, "unentitled_ios_sim_launch", false);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++static TUNABLE(bool, lisa_quiet_exec, "lisa_quiet_exec", false);
++#endif
+ #endif /* DEBUG || DEVELOPMENT */
+ #endif /* XNU_TARGET_OS_OSX */
+ 
+@@ -7413,7 +7416,10 @@
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+-			printf("exec %s\n", p->p_name);
++			if (!lisa_quiet_exec || (strcmp(p->p_name, "fairplayd.H2") &&
++			    strcmp(p->p_name, "xpcproxy") && strcmp(p->p_name, "bluetoothd"))) {
++				printf("exec %s\n", p->p_name);
++			}
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "

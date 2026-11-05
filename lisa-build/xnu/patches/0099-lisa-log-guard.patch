@@ -1,0 +1,56 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -825,7 +825,10 @@
+ 	uint32_t lisa_status = 0;
+ 	PE_parse_boot_argn("lisa_status", &lisa_status, sizeof(lisa_status));
+ 	if (lisa_status == 1) lisa_status_start();
+-	/* Lisa input, USB and persistent logging need independent hardware ports. */
++	uint32_t lisa_log = 0;
++	PE_parse_boot_argn("lisa_ufs_log", &lisa_log, sizeof(lisa_log));
++	if (lisa_log == 1) sweet_log_start();
++	/* Lisa input and USB need independent hardware ports. */
+ 	return 0;
+ }
+ 
+@@ -960,6 +963,23 @@
+ 
+ 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
+ 	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		return;
++	}
++	/* The ring is raw partition tail space, never inside the HFS volume.
++	 * Verify the live volume header before permitting any log writes. */
++	lck_mtx_lock(&sweet_ufs_lock);
++	int err = ufs_read_blocks(su.first_block, 1);
++	const uint8_t *h = (const uint8_t *)(su.dma + DMA_BOUNCE + 1024);
++	uint32_t block = ((uint32_t)h[40] << 24) | ((uint32_t)h[41] << 16) |
++	    ((uint32_t)h[42] << 8) | h[43];
++	uint32_t blocks = ((uint32_t)h[44] << 24) | ((uint32_t)h[45] << 16) |
++	    ((uint32_t)h[46] << 8) | h[47];
++	bool safe = !err && h[0] == 'H' && (h[1] == '+' || h[1] == 'X') &&
++	    block >= 512 && !(block & (block - 1)) && blocks &&
++	    (uint64_t)block * blocks <= (su.nblocks - SWEET_LOG_BLOCKS) * UFS_BLOCK;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (!safe) {
++		printf("LISA LOG: volume bounds unavailable; logging disabled\n");
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("ufslogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -394,7 +394,6 @@
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			__atomic_add_fetch(&lisa_fb_copied, 1, __ATOMIC_RELAXED);
+ 			/* Keep diagnostics visible until a real, validated layer is ready. */
+ 			if (!fConsolePaused) {
+ 				int quiet = 0;
+@@ -410,6 +409,7 @@
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			__atomic_add_fetch(&lisa_fb_copied, 1, __ATOMIC_RELAXED);
+ 		}
+ 		s->release();
+ 	}

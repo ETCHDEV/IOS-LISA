@@ -1,0 +1,1253 @@
+diff --git a/NativeAdrenoCpu.cpp b/NativeAdrenoCpu.cpp
+index 862de46..ee4a58a 100644
+--- a/NativeAdrenoCpu.cpp
++++ b/NativeAdrenoCpu.cpp
+@@ -36,7 +36,10 @@ IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
+     out->kernel_page_bytes=page_size;
+     out->kernel_map_page_bytes=vm_map_page_size(kernel_map);
+     enable_preemption();
+-    bool native=PAGE_SIZE==4096 && out->kernel_page_bytes==4096 && out->kernel_map_page_bytes==4096 &&
++    /* The translation granule is what the GPU and its SMMU share with the CPU: 4 KiB for TTBR0 and TTBR1. The VM page above it may be
++     * 4 KiB or 16 KiB (xnu-12377 on a 4 KiB granule keeps 16 KiB VM pages); a VM page is then four granules, and a ppnum_t counts VM
++     * pages. */
++    bool native=(PAGE_SIZE==4096 || PAGE_SIZE==16384) && out->kernel_page_bytes==PAGE_SIZE && out->kernel_map_page_bytes==PAGE_SIZE &&
+         ((out->tcr>>14)&3)==0 && ((out->tcr>>30)&3)==2 &&
+         (out->sctlr&1) && (out->ttbr1&UINT64_C(0x0000fffffffff000));
+     return native?kIOReturnSuccess:kIOReturnUnsupported;
+@@ -119,9 +122,10 @@ IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *spans,siz
+             span.physical<gPhysBase || span.physical+span.bytes-gPhysBase>gPhysSize)return kIOReturnBadArgument;
+         pages+=span.bytes/4096;
+     }
++    /* The attribute belongs to a VM page: every VM page a span touches. */
+     for(size_t i=0;i<count;++i)
+-        for(uint64_t offset=0;offset<spans[i].bytes;offset+=4096)
+-            pmap_set_cache_attributes((ppnum_t)((spans[i].physical+offset)>>12),write_combined?VM_WIMG_WCOMB:VM_WIMG_USE_DEFAULT);
++        for(uint64_t page=spans[i].physical&~(uint64_t)PAGE_MASK;page<spans[i].physical+spans[i].bytes;page+=PAGE_SIZE)
++            pmap_set_cache_attributes((ppnum_t)(page>>PAGE_SHIFT),write_combined?VM_WIMG_WCOMB:VM_WIMG_USE_DEFAULT);
+     if(write_combined)__atomic_fetch_add(&native_adreno_cache_stats[4],pages,__ATOMIC_RELAXED);
+     else __atomic_fetch_sub(&native_adreno_cache_stats[4],pages,__ATOMIC_RELAXED);
+     return kIOReturnSuccess;
+@@ -134,8 +138,8 @@ IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *spans
+         const NativeAdrenoPhysicalSpan &span=spans[i];
+         if(!span.bytes || ((span.physical|span.bytes)&4095) || span.physical>UINT64_MAX-span.bytes ||
+             span.physical<gPhysBase || span.physical+span.bytes-gPhysBase>gPhysSize)return kIOReturnBadArgument;
+-        for(uint64_t offset=0;offset<span.bytes;offset+=4096) {
+-            const ppnum_t pn=(ppnum_t)((span.physical+offset)>>12);
++        for(uint64_t page=span.physical&~(uint64_t)PAGE_MASK;page<span.physical+span.bytes;page+=PAGE_SIZE) {
++            const ppnum_t pn=(ppnum_t)(page>>PAGE_SHIFT);
+             /* From the default attribute the pmap also cleans and invalidates the page (pmap_sync_wimg), so lines a cacheable view
+              * dirtied reach DRAM before the GPU reads it. */
+             if((pmap_cache_attributes(pn)&VM_WIMG_MASK)!=VM_WIMG_WCOMB) {pmap_set_cache_attributes(pn,VM_WIMG_WCOMB);++*reset;}
+diff --git a/NativeAdrenoGmuContext.cpp b/NativeAdrenoGmuContext.cpp
+index eb41fd9..516ef9e 100644
+--- a/NativeAdrenoGmuContext.cpp
++++ b/NativeAdrenoGmuContext.cpp
+@@ -16,12 +16,14 @@ static void readBack(const ArmSmmu4KIo *io,const ArmSmmu4KProgramResult *program
+     io->read64(io->cookie,size_t(program->context_offset)+0x20,&r->ttbr0);
+ }
+ IOReturn NativeAdrenoGmuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,
+-    unsigned slot,uint16_t sid,void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report)
++    const ArmSmmu4KStream *routes,unsigned count,void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report)
+ {
+     if(!report)return kIOReturnBadArgument;
+     *report={};
+     if(used_)return kIOReturnBusy;
+-    if(!io || bank>63 || !asid || asid>0xffff || slot>127)return kIOReturnBadArgument;
++    if(!io || bank>63 || !asid || asid>0xffff || !routes || !count || count>2)return kIOReturnBadArgument;
++    for(unsigned i=0;i<count;++i)if(routes[i].slot>127)return kIOReturnBadArgument;
++    const unsigned slot=routes[0].slot;
+     used_=true;
+     IOReturn status=kIOReturnSuccess;
+     auto step=[&](Step s) {report->step=s;if(progress)progress(s);};
+@@ -39,7 +41,7 @@ IOReturn NativeAdrenoGmuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
+     if(!status)status=gmu_.allocate(NativeAdrenoGmuDefaultSizes(TablePages*0x1000),report->output_bits);
+     if(!status) {
+         step(Prepare);
+-        status=smmu_.prepare(&gmu_.tables(),0,0,GmuApertureBytes,NativeAdrenoSmmuContext::MaxLeaves,
++        status=smmu_.prepare(&gmu_.tables(),0,0,GmuApertureBytes,GmuApertureBytes/4096,
+             bank,asid,1000,report->output_bits);
+     }
+     if(!status) {
+@@ -63,8 +65,7 @@ IOReturn NativeAdrenoGmuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
+     }
+     if(!status) {
+         step(Attach);
+-        const ArmSmmu4KStream route{slot,sid};
+-        status=smmu_.attach(&route,1);
++        status=smmu_.attach(routes,count);
+         const ArmSmmu4KStreamResult *s=smmu_.streamResult();
+         report->route_status=smmu_.attachStatus();
+         report->route_phase=s->phase;report->route_writes=s->writes;report->routes_verified=s->streams_verified;
+@@ -96,12 +97,14 @@ extern "C" IOReturn NativeAdrenoGmuContextBringup(volatile uint8_t *smmu,size_t
+     static ArmSmmu4KMmio mmio;
+     static ArmSmmu4KIo io;
+     NativeAdrenoGmuContext *&context=board_context;
+-    if(!report || context || !smmu || !bytes || sid>0xffff)return kIOReturnBadArgument;
++    ArmSmmu4KStream routes[2];
++    const unsigned count=NativeAdrenoRoutes(slot,sid,routes);
++    if(!report || context || !smmu || !bytes || !count)return kIOReturnBadArgument;
+     mmio={reinterpret_cast<volatile unsigned char *>(smmu),bytes};
+     if(ArmSmmu4KBindMmio(&mmio,&io)!=ArmSmmu4KSuccess)return kIOReturnBadArgument;
+     context=new NativeAdrenoGmuContext;
+     if(!context)return kIOReturnNoMemory;
+-    return context->bringUp(&io,bank,asid,slot,uint16_t(sid),progress,report);
++    return context->bringUp(&io,bank,asid,routes,count,progress,report);
+ }
+ extern "C" IOReturn NativeAdrenoGmuContextPayloads(NativeAdrenoGmuPayload out[5])
+ {
+diff --git a/NativeAdrenoGmuContext.h b/NativeAdrenoGmuContext.h
+index b6e4b12..a39033b 100644
+--- a/NativeAdrenoGmuContext.h
++++ b/NativeAdrenoGmuContext.h
+@@ -41,14 +41,32 @@ public:
+     NativeAdrenoGmuContext(const NativeAdrenoGmuContext &)=delete;
+     NativeAdrenoGmuContext &operator=(const NativeAdrenoGmuContext &)=delete;
+     /* One attempt per object. progress (may be null) is called before each step. */
+-    IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,unsigned slot,
+-        uint16_t sid,void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report);
++    /* routes[0] is the stream the report reads back; the rest are its TBU aliases. */
++    IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const ArmSmmu4KStream *routes,
++        unsigned count,void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report);
+     bool ready() const {return ready_;}
+     NativeAdrenoGmuAllocator &allocator() {return gmu_;}
+     NativeAdrenoVm &vm() {return vm_;}
+ };
+ /* Board entry: binds the kit's direct MMIO adapter to an owned live mapping of the
+- * whole SMMU window and runs bringUp on a context that lives forever. */
++ * whole SMMU window and runs bringUp on a context that lives forever. sid may carry an
++ * iommus-style SMR mask in bits 16-30 (mask << 16 | id) when slot names a second slot in
++ * bits 8-15 (slot2 + 1) << 8: that slot routes id | mask, the stream of the other TBU (one
++ * mask bit only, as the Qualcomm Adreno SMMU's gfx_1 TBU adds 0x400 to every stream id). */
++#define NATIVE_ADRENO_ROUTE(slot,alias_slot) ((slot)|((alias_slot)+1u)<<8)
++#define NATIVE_ADRENO_STREAM(sid,mask) ((sid)|(mask)<<16)
++/* Splits an entry's (slot, sid) into its exact routes; 0 on a malformed pair. Inline: the GPU context uses it too, and
++ * the host simulation links that context without this one. */
++inline unsigned NativeAdrenoRoutes(unsigned slot,unsigned sid,ArmSmmu4KStream out[2])
++{
++    const unsigned primary=slot&0xff,alias=slot>>8,id=sid&0xffff,mask=sid>>16;
++    if(primary>127 || alias>128 || id>0x7fff || mask>0x7fff || !alias!=!mask)return 0;
++    out[0]={primary,uint16_t(id)};
++    if(!alias)return 1;
++    if((mask&(mask-1)) || (id&mask) || alias-1==primary || alias-1>127)return 0;
++    out[1]={alias-1,uint16_t(id|mask)};
++    return 2;
++}
+ extern "C" IOReturn NativeAdrenoGmuContextBringup(volatile uint8_t *smmu,size_t bytes,
+     unsigned bank,unsigned asid,unsigned slot,unsigned sid,void (*progress)(uint32_t),
+     NativeAdrenoGmuContextReport *report);
+diff --git a/NativeAdrenoGpuContext.cpp b/NativeAdrenoGpuContext.cpp
+index dfac46d..1af2a2d 100644
+--- a/NativeAdrenoGpuContext.cpp
++++ b/NativeAdrenoGpuContext.cpp
+@@ -8,14 +8,17 @@ extern "C" volatile uint32_t native_adreno_pool_stats[8],native_adreno_pool_stat
+ extern "C" volatile uint32_t native_adreno_wc_enabled,native_adreno_pool_wc;
+ static const uint64_t kIovas[GpuBufferCount]={GpuSqeIova,GpuRingIova,GpuMemptrsIova,GpuPwrupIova,GpuScratchIova};
+ static const size_t kBytes[GpuBufferCount]={GpuSqeBytes,GpuRingBytes,GpuPageBytes,GpuPageBytes,GpuPageBytes};
+-IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
+-    const uint16_t sids[2],void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report)
++IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const ArmSmmu4KStream *routes,
++    unsigned count,void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report)
+ {
+     if(!report)return kIOReturnBadArgument;
+     *report={};
+     if(used_)return kIOReturnBusy;
+-    if(!io || !slots || !sids || bank>63 || !asid || asid>0xffff || slots[0]>127 || slots[1]>127 ||
+-        slots[0]==slots[1])return kIOReturnBadArgument;
++    if(!io || !routes || count<2 || count>4 || bank>63 || !asid || asid>0xffff)return kIOReturnBadArgument;
++    for(unsigned i=0;i<count;++i) {
++        if(routes[i].slot>127)return kIOReturnBadArgument;
++        for(unsigned j=0;j<i;++j)if(routes[i].slot==routes[j].slot)return kIOReturnBadArgument;
++    }
+     used_=true;
+     IOReturn status=kIOReturnSuccess;
+     auto step=[&](Step s) {report->step=s;if(progress)progress(s);};
+@@ -59,8 +62,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
+     }
+     if(!status) {
+         step(Attach);
+-        const ArmSmmu4KStream routes[2]={{slots[0],sids[0]},{slots[1],sids[1]}};
+-        status=smmu_.attach(routes,2);
++        status=smmu_.attach(routes,count);
+         const ArmSmmu4KStreamResult *s=smmu_.streamResult();
+         report->route_status=smmu_.attachStatus();
+         report->route_phase=s->phase;report->route_writes=s->writes;report->routes_verified=s->streams_verified;
+@@ -93,14 +95,14 @@ extern "C" IOReturn NativeAdrenoGpuContextBringup(volatile uint8_t *smmu,size_t
+ {
+     static ArmSmmu4KMmio mmio;
+     static ArmSmmu4KIo io;
+-    if(!report || board_gpu_context || !smmu || !bytes || sid0>0xffff || sid1>0xffff)return kIOReturnBadArgument;
++    ArmSmmu4KStream routes[4];
++    const unsigned first=NativeAdrenoRoutes(slot0,sid0,routes),second=first?NativeAdrenoRoutes(slot1,sid1,routes+first):0;
++    if(!report || board_gpu_context || !smmu || !bytes || !second)return kIOReturnBadArgument;
+     mmio={reinterpret_cast<volatile unsigned char *>(smmu),bytes};
+     if(ArmSmmu4KBindMmio(&mmio,&io)!=ArmSmmu4KSuccess)return kIOReturnBadArgument;
+     board_gpu_context=new NativeAdrenoGpuContext;
+     if(!board_gpu_context)return kIOReturnNoMemory;
+-    const unsigned slots[2]={slot0,slot1};
+-    const uint16_t sids[2]={uint16_t(sid0),uint16_t(sid1)};
+-    return board_gpu_context->bringUp(&io,bank,asid,slots,sids,progress,report);
++    return board_gpu_context->bringUp(&io,bank,asid,routes,first+second,progress,report);
+ }
+ extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5])
+ {
+diff --git a/NativeAdrenoGpuContext.h b/NativeAdrenoGpuContext.h
+index dbe915a..0f224fc 100644
+--- a/NativeAdrenoGpuContext.h
++++ b/NativeAdrenoGpuContext.h
+@@ -2,9 +2,10 @@
+ #ifndef NATIVE_ADRENO_GPU_CONTEXT_H
+ #define NATIVE_ADRENO_GPU_CONTEXT_H
+ #include "NativeAdrenoGmuContext.h"
++#include "NativeAdrenoAddressSpace.h"
+ 
+ /* The GPU's own SMMU context, built like the GMU's (NativeAdrenoGmuContext): a native4K lower-region (TTBR0) table
+- * pool for a 0..2 GiB GPU space, one context bank, the GPU's two streams routed to it, then the kernel buffers the
++ * pool for a 0..4 GiB GPU space, one context bank, the GPU's two streams routed to it, then the kernel buffers the
+  * command processor needs at fixed GPU addresses below the A740 GMEM window (UCHE_GMEM_RANGE_MIN 16 MiB):
+  *   sqe      the SQE microcode (a740_sqe.fw without its first dword, as adreno_fw_create_bo copies it), R+X
+  *   ring     ring buffer 0, 32 KiB, aligned to its size, R+W
+@@ -15,7 +16,7 @@
+  * a matching non-cacheable view. Bank, ASID, SMR slots and stream IDs are caller inputs. Nothing is torn down. */
+ enum : uint64_t {
+     GpuSqeIova=0x100000, GpuRingIova=0x200000, GpuMemptrsIova=0x300000, GpuPwrupIova=0x301000,
+-    GpuScratchIova=0x302000, GpuApertureBytes=0x80000000
++    GpuScratchIova=0x302000, GpuApertureBytes=NativeAdrenoGpuApertureBytes
+ };
+ enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
+ struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
+@@ -29,17 +30,18 @@ class NativeAdrenoGpuContext final {
+     bool ready_=false,used_=false;
+ public:
+     enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready};
+-    enum : size_t {TablePages=1027};
++    enum : size_t {TablePages=NativeAdrenoGpuTablePages};
+     NativeAdrenoGpuContext()=default;
+     NativeAdrenoGpuContext(const NativeAdrenoGpuContext &)=delete;
+     NativeAdrenoGpuContext &operator=(const NativeAdrenoGpuContext &)=delete;
+-    /* The report is the GMU context's: route counts cover both streams. */
+-    IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const unsigned slots[2],
+-        const uint16_t sids[2],void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report);
++    /* The report is the GMU context's: route counts cover every stream (both SIDs and their TBU aliases). */
++    IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const ArmSmmu4KStream *routes,
++        unsigned count,void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report);
+     bool ready() const {return ready_;}
+     const NativeAdrenoMemory &buffer(unsigned index) const {return buffers_[index];}
+     NativeAdrenoVm *vm() {return ready_?&vm_:nullptr;}
+ };
++/* slot0/sid0 and slot1/sid1 as NativeAdrenoGmuContextBringup reads its slot and sid. */
+ extern "C" IOReturn NativeAdrenoGpuContextBringup(volatile uint8_t *smmu,size_t bytes,unsigned bank,unsigned asid,
+     unsigned slot0,unsigned sid0,unsigned slot1,unsigned sid1,void (*progress)(uint32_t),
+     NativeAdrenoGmuContextReport *report);
+diff --git a/NativeAdrenoMemory.cpp b/NativeAdrenoMemory.cpp
+index cec75a7..98698a5 100644
+--- a/NativeAdrenoMemory.cpp
++++ b/NativeAdrenoMemory.cpp
+@@ -115,7 +115,14 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
+                 mapping_=pool.virt+offset;bytes_=bytes;pooled_=true;pool_offset_=offset;prepared_=true;
+                 bzero(mapping_,bytes);
+                 /* Through a write-combined pool's own mapping the zeros go to DRAM; the barrier completes them. */
+-                if(pool.write_combined)__asm__ volatile("dsb sy":::"memory");
++                if(pool.write_combined){
++#if defined(__aarch64__)
++        __asm__ volatile("dsb sy":::"memory");
++#else
++        /* Software kernel peer only: no device memory exists on the host. */
++        __atomic_thread_fence(__ATOMIC_SEQ_CST);
++#endif
++    }
+                 else status=NativeAdrenoMaintainOwnedPages(mapping_,bytes,NativeAdrenoClean);
+                 if(status!=kIOReturnSuccess) {(void)release();return status;}
+                 native_adreno_pool_stats[1]=native_adreno_pool_stats[1]+1;
+@@ -159,6 +166,20 @@ failed:
+      * as success. No object has been exposed to a GPU or userspace yet. */
+     (void)release();return status;
+ }
++/* An import holds the pages through a memory entry of its own (kIOMemoryPersistent), which references the VM object: the owner may unmap
++ * its range while the GPU still uses it (Core Animation frees an image's Shmem once its no-copy buffer is released, before the runtime frees
++ * the import), and the object then lives on until the import completes instead of being torn down under a wired UPL (int-233..235: the render
++ * thread stuck in vm_deallocate). A range no memory entry can be made of is imported as before; [0] counts the persistent imports, [1] those. */
++extern "C" {volatile uint32_t native_adreno_import_persistent[2];}
++static IOMemoryDescriptor *importRange(uint64_t address,size_t bytes,IODirection direction,void *task)
++{
++    const IOOptionBits options=static_cast<IOOptionBits>(direction)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
++    IOMemoryDescriptor *range=IOMemoryDescriptor::withAddressRange(address,bytes,options|kIOMemoryPersistent,static_cast<task_t>(task));
++    if(range) {native_adreno_import_persistent[0]=native_adreno_import_persistent[0]+1;return range;}
++    range=IOMemoryDescriptor::withAddressRange(address,bytes,options,static_cast<task_t>(task));
++    if(range)native_adreno_import_persistent[1]=native_adreno_import_persistent[1]+1;
++    return range;
++}
+ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes,unsigned bits,size_t budget)
+ {
+     native_adreno_import_stage=10;
+@@ -172,8 +193,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
+     native_adreno_import_stage=13;
+     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
+     const uint64_t limit=UINT64_C(1)<<bits;
+-    imported_=IOMemoryDescriptor::withAddressRange(address,bytes,
+-        static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone),static_cast<task_t>(task));
++    imported_=importRange(address,bytes,kIODirectionInOut,task);
+     native_adreno_import_stage=14;
+     if(!imported_)return kIOReturnNoMemory;
+     native_adreno_import_stage=15;
+@@ -182,8 +202,7 @@ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes
+         /* Read-only memory of the owner (a mapped file, constant data): cannot be pinned for writing. Pin it for reading only; the GPU then maps it
+          * read-only. Metal's no-copy buffers over such memory are only ever read by shaders. */
+         imported_->release();imported_=nullptr;
+-        imported_=IOMemoryDescriptor::withAddressRange(address,bytes,
+-            static_cast<IOOptionBits>(kIODirectionOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone),static_cast<task_t>(task));
++        imported_=importRange(address,bytes,kIODirectionOut,task);
+         if(!imported_)return kIOReturnNoMemory;
+         status=imported_->prepare();
+         if(status==kIOReturnSuccess)read_only_=true;
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index 1d74546..8293b25 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -19,10 +19,14 @@
+ #include <string.h>
+ #include <kern/thread.h>
+ #include "NativeAdrenoUserClient.h"
++#include "NativeAdrenoAddressSpace.h"
+ 
+ extern "C" void proc_selfname(char *, int);
+ /* The plugin's telemetry table (rows of text the Metal bridge keeps), sent as markers: 0xC000|row starts a row, 0x8000|(a<<7)|b appends two characters. */
+ extern "C" {char native_adreno_metal_rows[48][96];volatile uint32_t native_adreno_metal_rows_seq;}
++/* The same text stream from a listed client (any process but the render server): its own line, so two processes streaming at once
++ * cannot interleave their characters into the render server's report lines. */
++extern "C" {char native_adreno_client_text[64];char native_adreno_client_name[17];}
+ 
+ extern "C" {
+ /* What the processes that reached this driver did, for the boot diagnostic page. Plain counters and short strings. */
+@@ -60,6 +64,7 @@ enum : UInt32 {NativeAdrenoExportMethod=0x7100,NativeAdrenoExportMaxPiece=3968};
+ extern "C" int boot_log_export_put(uint32_t generation,uint32_t total,uint32_t offset,const void *data,uint32_t size) __attribute__((weak_import));
+ extern "C" {volatile uint32_t native_adreno_export_stats[4];}   /* [0] pieces taken, [1] refused, [2] last generation, [3] its total bytes */
+ extern "C" IOMemoryDescriptor *native_gop_handoff_memory(void);
++extern "C" void native_gop_gpu_drained_client_gone(void) __attribute__((weak_import));
+ 
+ /* Mailbox: a last-resort command channel for a sandbox that admits no external-method selector at all. It is one shared page (memory
+  * type NativeAdrenoMailboxType through IOConnectMapMemory64, which the selector filter does not cover) and a kernel poller that runs
+@@ -97,12 +102,9 @@ struct NativeAdrenoClientRecord native_adreno_client_log[8];
+ struct NativeAdrenoAskerRecord {char name[20]; uint32_t reads;};
+ struct NativeAdrenoAskerRecord native_adreno_metal_askers[12];
+ }
+-/* GPU address windows inside the board's VA range (GpuPowerProbe gDeviceInfo: 0x20000000..0x80000000 of the 2 GiB aperture). Slot 0 is the
+- * render server's (it held the whole 1.5 GiB alone before int-155 and used at most a few hundred MiB); slots 1 and 2 are for other Metal
+- * processes. A kernel connection (the board's self-test) maps where it likes and is never scoped. */
+-enum : unsigned {NativeAdrenoMaxClients=3};
+-static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={
+-    {0x20000000ull,0x40000000ull},{0x60000000ull,0x10000000ull},{0x70000000ull,0x10000000ull}};
++/* Share the exact aperture layout with the GPU context and board metadata. */
++enum : unsigned {NativeAdrenoMaxClients=NativeAdrenoGpuClientCount};
++static constexpr auto &kClientWindows=NativeAdrenoGpuWindows;
+ 
+ namespace {
+ void shiftName(char names[3][17]) {
+@@ -148,11 +150,11 @@ class AGXDeviceUserClient : public IOUserClient {
+      * unmap a silent no-op, the user PTEs outlived BoCpuUnmap, and BoFree handed pages with a live user mapping to the VM:
+      * pmap_assert_free panicked the freeing core and the panic screen parked it (the "BoFree hang", dead touch). */
+     struct View {uint32_t token;IOMemoryDescriptor *descriptor;};
+-    /* One view per live BO token. The cache must hold every BO the client can have (NativeAdrenoClientMaxObjects = 1024): a BO whose view is not
++    /* One view per live BO token. The cache must hold every BO the client can have (NativeAdrenoClientMaxObjects): a BO whose view is not
+      * cached makes IOConnectUnmapMemory64 (which asks clientMemoryForType again) a no-op, the user mapping outlives BoFree and the freed pages panic
+      * pmap_assert_free. A cache of 64 held until the render server's hundreds of mapped BOs (int-087). */
+-    enum {MaxViews=1024};
+-    View *views_=nullptr;   /* on the heap: 1024 entries would make the client object too big for the kernel allocator's fixed-size classes */
++    enum {MaxViews=NativeAdrenoClientMaxObjects};
++    View *views_=nullptr;   /* on the heap: the entries would make the client object too big for the kernel allocator's fixed-size classes */
+     void dropViews(uint32_t token);
+     static IOReturn action(OSObject *target,void *reference,IOExternalMethodArguments *arguments);
+     IOReturn run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
+@@ -265,8 +267,14 @@ void AGXDeviceUserClient::dropViews(uint32_t token)
+         if(views_)for(size_t i=0;i<MaxViews;++i) {View &v=views_[i];if(v.descriptor && (!token || v.token==token)) {view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
+         IOLockUnlock(g.lock);
+         if(!view)return;
+-        /* The returned reference is the last one outside the descriptor's own list: dropping it frees the map, which unmaps the user range. */
+-        while(removeMappingForDescriptor(view))native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
++        /* removeMappingForDescriptor hands back the map retained. Unmapping first takes the user range down even while another reference
++         * lives; the release then frees the map. Dropping it unreleased left the PTEs of a client that died with its BOs mapped, and
++         * releaseAll freed those pages under them (pmap_assert_free: "First PTEP is a User CPU mapping" when backboardd aborted). */
++        while(IOMemoryMap *map=removeMappingForDescriptor(view)) {
++            map->unmap();
++            map->release();
++            native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
++        }
+         view->release();
+     }
+ }
+@@ -276,6 +284,7 @@ IOReturn AGXDeviceUserClient::clientClose()
+     IOLockLock(g.lock);
+     IOReturn status=kIOReturnSuccess;
+     AGXDeviceUserClient *mailbox=nullptr;
++    unsigned releasedSlot=NativeAdrenoMaxClients;
+     if(gMailboxOwner==this) {mailbox=gMailboxOwner;gMailboxOwner=nullptr;}
+     if(live_) {
+         const uint64_t peak=core_->windowPeak();
+@@ -283,7 +292,7 @@ IOReturn AGXDeviceUserClient::clientClose()
+         /* A failed teardown leaves the objects live and the slot taken: nothing is forced or reused. */
+         if(!status) {
+             live_=false;
+-            if(kernel_)g.kernel_client=false;else if(slot_<NativeAdrenoMaxClients)g.slots[slot_]=false;
++            if(kernel_)g.kernel_client=false;else if(slot_<NativeAdrenoMaxClients)releasedSlot=slot_;
+             ++g.closed;native_adreno_metal_diag.closes=native_adreno_metal_diag.closes+1;
+             if(NativeAdrenoClientRecord *record=clientRecord(name_)) {
+                 record->closes=record->closes+1;record->slot=0xff;
+@@ -292,6 +301,10 @@ IOReturn AGXDeviceUserClient::clientClose()
+         }
+     }
+     IOLockUnlock(g.lock);
++    if(releasedSlot<NativeAdrenoMaxClients) {
++        if(releasedSlot==0 && native_gop_gpu_drained_client_gone)native_gop_gpu_drained_client_gone();
++        IOLockLock(g.lock);g.slots[releasedSlot]=false;IOLockUnlock(g.lock);
++    }
+     if(mailbox)mailbox->release();
+     if(!status)terminate();
+     return status;
+@@ -299,7 +312,7 @@ IOReturn AGXDeviceUserClient::clientClose()
+ void AGXDeviceUserClient::free()
+ {
+     dropViews(0);
+-    if(views_) {IODeleteData(views_,View,MaxViews);views_=nullptr;}
++    if(views_) {IODelete(views_,View,MaxViews);views_=nullptr;}   /* IONewZero: a typed (pointer-holding) allocation, not data */
+     /* Still live only when a teardown failed: its objects stay referenced by the VM and the ring, so the core is kept, not freed. */
+     if(core_ && !live_) {delete core_;core_=nullptr;}
+     IOUserClient::free();
+@@ -562,6 +575,19 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
+             return kIOReturnUnsupported;
+         }
+         if(value>=0x7000 && value<0x8000) {
++            char self[17]={};
++            proc_selfname(self,sizeof self);
++            if(strncmp(self,"backboardd",sizeof self)) {
++                static uint32_t client_length;
++                if(value==0x7fff || value==0x7ffe) {
++                    memset(native_adreno_client_text,0,sizeof native_adreno_client_text);client_length=0;
++                    strlcpy(native_adreno_client_name,self,sizeof native_adreno_client_name);
++                }
++                else if(value<0x7100 && client_length<sizeof(native_adreno_client_text)-1) {
++                    native_adreno_client_text[client_length++]=char(value&0xff);native_adreno_client_text[client_length]=0;
++                }
++                return kIOReturnUnsupported;
++            }
+             /* 0x7ffe starts a line in report (GPU7) instead: the Metal bridge's result, after the raw test's line has been read. */
+             static uint32_t length;
+             static char *line=native_adreno_metal_diag.report2;
+@@ -720,3 +746,17 @@ extern "C" IOService *native_adreno_published_service()
+ {
+     return g.service;
+ }
++/* The plugin's text, for a kernel printer (the boot page is off under NOTRACE): the telemetry rows, their sequence, and the report (GPU7)
++ * and report2 lines; with client, the latest client line and the process that sent it. */
++extern "C" const char *native_adreno_metal_text(const char **report,const char **report2,uint32_t *seq)
++{
++    if(report)*report=native_adreno_metal_diag.report;
++    if(report2)*report2=native_adreno_metal_diag.report2;
++    if(seq)*seq=native_adreno_metal_rows_seq;
++    return native_adreno_metal_rows[0];
++}
++extern "C" const char *native_adreno_client_line(const char **name)
++{
++    if(name)*name=native_adreno_client_name;
++    return native_adreno_client_text;
++}
+diff --git a/NativeAdrenoRing.cpp b/NativeAdrenoRing.cpp
+index 1711ea1..cc99fa9 100644
+--- a/NativeAdrenoRing.cpp
++++ b/NativeAdrenoRing.cpp
+@@ -20,6 +20,8 @@ enum : uint32_t {
+     RingFenceEvent = 0x31,    /* CACHE_CLEAN */
+     RingFenceEnable = 1u << 27,
+     RingFenceIrq = 1u << 31,
++    RingA6xxCacheFlushTs = 0x04,  /* CACHE_FLUSH_TS, adreno_pm4types.h */
++    RingA6xxPrologueWords = 4,    /* a6xx_submit(): CP_EVENT_WRITE PC_CCU_INVALIDATE_DEPTH, then _COLOR */
+     RingBlockBytes = 32,
+     /* A7XX framing, as a7xx_submit() in the pinned a6xx_gpu.c emits it: CP_THREAD_CONTROL (0x17; THREAD bits 0..1,
+      * BR 1, BV 2, BOTH 3; SYNC_THREADS bit 31), CP_SET_MARKER (0x65; 0x101 IFPC disable, 0x100 enable), CCU_INVALIDATE_DEPTH
+@@ -91,6 +93,15 @@ static size_t packet(uint32_t *words,size_t at,uint32_t opcode,const uint32_t *p
+ IOReturn NativeAdrenoRing::emitPrologue(uint32_t at,bool reset,uint32_t *end)
+ {
+     const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
++    if(a6xx_) {
++        uint32_t words[RingA6xxPrologueWords];
++        const uint32_t depth=RingCcuInvalidateDepth,color=RingCcuInvalidateColor;
++        size_t n=packet(words,0,RingFenceOpcode,&depth,1);
++        if(n)n=packet(words,n,RingFenceOpcode,&color,1);
++        if(n!=RingA6xxPrologueWords)return poison();
++        for(uint32_t i=0;i<RingA6xxPrologueWords;++i)ring_[(at+i)&mask]=words[i];
++        *end=(at+RingA6xxPrologueWords)&mask;return kIOReturnSuccess;
++    }
+     uint32_t words[RingPrologueWords+RingResetWords]={0};
+     const uint32_t br=RingSyncThreads|RingThreadBr,syncBoth=RingSyncThreads|RingThreadBoth,both=RingThreadBoth,marker=0x101;
+     const uint32_t count=RingPrologueWords+(reset?RingResetWords:0);
+@@ -128,7 +139,7 @@ IOReturn NativeAdrenoRing::emitFence(uint32_t at,uint32_t seqno,uint32_t *end)
+     if(AdrenoPM4Type4(RingScratch,1,&words[0])!=AdrenoPM4Success ||
+         AdrenoPM4Type7(RingFenceOpcode,4,&words[2])!=AdrenoPM4Success)return poison();
+     words[1]=seqno;
+-    words[3]=RingFenceEvent|RingFenceEnable|RingFenceIrq;
++    words[3]=a6xx_?RingA6xxCacheFlushTs|RingFenceIrq:RingFenceEvent|RingFenceEnable|RingFenceIrq;
+     /* The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it; +0 is the CP's RPTR shadow. */
+     const uint64_t at4=fence_iova_+4;
+     words[4]=(uint32_t)at4;words[5]=(uint32_t)(at4>>32);words[6]=seqno;
+@@ -213,8 +224,9 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+     if(!words || !word_count || word_count>SIZE_MAX/sizeof(uint32_t))return kIOReturnBadArgument;
+     const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
+-    const bool reset=framed && reset_pending_;
+-    const uint32_t extra=framed?RingPrologueWords+(reset?RingResetWords:0)+RingFramedFenceWords:RingFenceWords;
++    const bool reset=framed && reset_pending_ && !a6xx_;
++    const uint32_t extra=!framed?RingFenceWords:a6xx_?RingA6xxPrologueWords+RingFenceWords:
++        RingPrologueWords+(reset?RingResetWords:0)+RingFramedFenceWords;
+     if(word_count>size_words-extra-8)return kIOReturnNoResources;
+     uint32_t rptr=0;IOReturn status=readRptr(&rptr);
+     if(status)return status;
+@@ -228,7 +240,7 @@ IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,u
+     for(size_t i=0;i<word_count;++i)ring_[(at+i)&mask]=words[i];
+     at=(at+(uint32_t)word_count)&mask;
+     uint32_t end=0;
+-    status=framed?emitFramedFence(at,seqno_+1,&end):emitFence(at,seqno_+1,&end);
++    status=framed && !a6xx_?emitFramedFence(at,seqno_+1,&end):emitFence(at,seqno_+1,&end);
+     if(status)return status;
+     /* Whole-ring publication is deliberate: a submission may wrap, and one
+      * clean of the owned pool is cheaper than a split range proof. */
+diff --git a/NativeAdrenoRing.h b/NativeAdrenoRing.h
+index 55c6a93..da20a55 100644
+--- a/NativeAdrenoRing.h
++++ b/NativeAdrenoRing.h
+@@ -50,7 +50,7 @@ class NativeAdrenoRing final {
+     size_t ring_bytes_=0,fence_bytes_=0;
+     uint64_t ring_iova_=0,fence_iova_=0;
+     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
+-    bool attached_=false,poisoned_=false,reset_pending_=false;
++    bool attached_=false,poisoned_=false,reset_pending_=false,a6xx_=false;
+     IOReturn poison();
+     IOReturn readRptr(uint32_t *);
+     IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
+@@ -82,6 +82,11 @@ public:
+     /* The next framed submission starts with the A7XX context entry of a6xx_set_pagetable() (BR/BV counters, on-chip
+      * timestamps and resource table cleared between thread syncs); a new user client requests it, as Linux does per context. */
+     void requestContextReset() {reset_pending_=true;}
++    /* A6XX framing (zeta, Adreno 660), before attach. The plain submit() fence becomes the stock KGSL one, CP_EVENT_WRITE
++     * with CACHE_FLUSH_TS and the interrupt bit (adreno_ringbuffer.c), without the A7XX WRITE_ENABLED field. submitFramed()
++     * frames user buffers as drm/msm a6xx_submit() does: CCU depth and color invalidates before them, that same fence after,
++     * no thread control or context entry (one page table, no BV thread). */
++    void useA6xxFence() {if(!attached_)a6xx_=true;}
+     /* Polls the CP-written timestamp after invalidating the fence page. Never
+      * writes registers and never advances the ring. Timeout is not poison. */
+     NativeAdrenoRingFence wait(uint32_t fence,const NativeAdrenoRingClock *,
+diff --git a/NativeAdrenoService.cpp b/NativeAdrenoService.cpp
+index 8f26903..724f4db 100644
+--- a/NativeAdrenoService.cpp
++++ b/NativeAdrenoService.cpp
+@@ -332,7 +332,8 @@ bool NativeAdrenoGpuService::start(IOService *provider)
+                 ArmSmmu4KIo smmu_io{&window,smmu_bytes,smmu_read32,smmu_read64,
+                     smmu_write32,smmu_write64,smmu_barrier};
+                 NativeAdrenoGmuContextReport report{};
+-                IOReturn status=gmu_ctx_.bringUp(&smmu_io,bank,asid,slot,uint16_t(sid),nullptr,&report);
++                const ArmSmmu4KStream route{slot,uint16_t(sid)};
++                IOReturn status=gmu_ctx_.bringUp(&smmu_io,bank,asid,&route,1,nullptr,&report);
+                 NativeAdrenoGmuAllocator &gmu_=gmu_ctx_.allocator();
+                 NativeAdrenoVm &vm_=gmu_ctx_.vm();
+                 if(status) {
+diff --git a/NativeAdrenoSmmuContext.h b/NativeAdrenoSmmuContext.h
+index 4ed1bcc..5a85285 100644
+--- a/NativeAdrenoSmmuContext.h
++++ b/NativeAdrenoSmmuContext.h
+@@ -30,8 +30,8 @@ public:
+     ~NativeAdrenoSmmuContext()=default;
+     NativeAdrenoSmmuContext(const NativeAdrenoSmmuContext &)=delete;
+     NativeAdrenoSmmuContext &operator=(const NativeAdrenoSmmuContext &)=delete;
+-    /* A 2 GiB lower aperture, the GMU's, is 524288 leaves. */
+-    enum : size_t {MaxLeaves=size_t(1)<<19};
++    /* Maximum: the GPU's 4 GiB aperture. GMU retains its 2 GiB bound. */
++    enum : size_t {MaxLeaves=size_t(1)<<20};
+     /* iova/bytes describe the aperture in the chosen region; the pool must be contiguous. */
+     /* output_bits: the context's output size, at most the SMMU's ID2.OAS (Linux uses OAS for stage 1). */
+     IOReturn prepare(NativeAdrenoMemory *tables,unsigned upper,uint64_t iova,size_t bytes,
+diff --git a/NativeAdrenoSubmit.cpp b/NativeAdrenoSubmit.cpp
+index 238ebb6..2dd0bfa 100644
+--- a/NativeAdrenoSubmit.cpp
++++ b/NativeAdrenoSubmit.cpp
+@@ -118,7 +118,14 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+      * caches over every mapped BO are cleaned and invalidated. The board shows the last submission's record on a stall. */
+     uint32_t cached=~0u,before=~0u,ignored=0,after=~0u;
+     /* Write-combined stores this CPU made before the call (the client's command words) complete before anything below. */
+-    __asm__ volatile("dsb sy":::"memory");
++    {
++#if defined(__aarch64__)
++        __asm__ volatile("dsb sy":::"memory");
++#else
++        /* Software kernel peer only: no device memory exists on the host. */
++        __atomic_thread_fence(__ATOMIC_SEQ_CST);
++#endif
++    }
+     /* int-098/099: with write-combined user BOs and no maintenance the CP stopped at the end of the first IB, as in int-065..069 when an
+      * IB sat in a CPU cache. While write-combined BOs are trusted, every line of this submission's IBs is compared as a CPU cache and
+      * DRAM hold it (bounded). A dirty line means a client view still caches its BOs: maintain every BO from now on, this submission
+diff --git a/NativeAdrenoUserClient.cpp b/NativeAdrenoUserClient.cpp
+index b3dd3b6..064c819 100644
+--- a/NativeAdrenoUserClient.cpp
++++ b/NativeAdrenoUserClient.cpp
+@@ -6,6 +6,34 @@ extern "C" {volatile uint32_t native_adreno_wc_enabled=1;}
+ /* BoImport record: [0] calls, [1] refused, [2..5] last refusal (status, stage, bytes, address), [6..9] first refusal. Stages 1..3 are this file's
+  * checks, 10..19 NativeAdrenoMemory::importTask's. */
+ extern "C" {volatile uint64_t native_adreno_import_diag[10];}
++/* Terminal BoAlloc memory refusals, retained across client close/respawn. All
++ * published clients' allocBo calls are serialized by NativeAdrenoPublish's
++ * g.lock, like the allocator/VM they share. Schema: [0] version 1, [1] failure
++ * count, [2] publication sequence (odd while writing), [3..10] last and [11..18]
++ * first (status, phase, live objects after cleanup, requested bytes, window peak,
++ * client address, align_log2, contiguous), [19] per-client object limit.
++ * Phases: 1 no client entry, 2 NativeAdrenoMemory::allocate, 3 write-combine.
++ * No successful attempt or recovered contiguous fallback is recorded. */
++extern "C" {volatile uint64_t native_adreno_alloc_diag[20]={1};}
++/* Ordinary BOs use pool/scattered pages. Explicitly opt in to the legacy
++ * contiguous-first policy only for controlled comparisons; never for hardware
++ * buffers, whose callers still request physical contiguity explicitly. */
++extern "C" {volatile uint32_t native_adreno_contiguous_first;}
++static void noteAllocFailure(IOReturn status,uint32_t phase,size_t live,
++    const NativeAdrenoAbiBoAlloc *request,uint64_t peak,const void *client)
++{
++    const uint64_t seq=__atomic_fetch_add(&native_adreno_alloc_diag[2],1,__ATOMIC_ACQ_REL);
++    const uint64_t count=native_adreno_alloc_diag[1]+1;
++    native_adreno_alloc_diag[1]=count;
++    const uint64_t record[8]={(uint32_t)status,phase,live,request->bytes,peak,
++        (uint64_t)(uintptr_t)client,request->align_log2,request->contiguous};
++    for(unsigned i=0;i<8;++i) {
++        native_adreno_alloc_diag[3+i]=record[i];
++        if(count==1)native_adreno_alloc_diag[11+i]=record[i];
++    }
++    native_adreno_alloc_diag[19]=NativeAdrenoClientMaxObjects;
++    __atomic_store_n(&native_adreno_alloc_diag[2],seq+2,__ATOMIC_RELEASE);
++}
+ extern "C" volatile uint32_t native_adreno_import_stage;
+ extern "C" volatile uint32_t native_adreno_io_coherent;
+ /* Per kernel method: [method][0] calls, [1] calls that returned non-zero, [2] last status, [3] total time (us, 32-bit). Method numbers are the ABI's (1..16). */
+@@ -74,9 +102,9 @@ IOReturn NativeAdrenoUserClient::setScope(uint32_t queue_base,uint64_t window_st
+     if(queue_base%NativeAdrenoAbiMaxQueues || queue_base>UINT32_MAX-NativeAdrenoAbiMaxQueues || (window_start&4095) || (window_bytes&4095) ||
+         (window_bytes && (window_start+window_bytes<window_start || window_start+window_bytes>(UINT64_C(1)<<input_bits_))))
+         return kIOReturnBadArgument;
+-    if(liveObjects() || submit_->rangeOutstanding(queue_base_,NativeAdrenoAbiMaxQueues) ||
++    if(liveObjects() || (scoped_ && submit_->rangeOutstanding(queue_base_,NativeAdrenoAbiMaxQueues)) ||
+         submit_->rangeOutstanding(queue_base,NativeAdrenoAbiMaxQueues))return kIOReturnBusy;
+-    queue_base_=queue_base;window_start_=window_start;window_bytes_=window_bytes;window_peak_=0;
++    queue_base_=queue_base;window_start_=window_start;window_bytes_=window_bytes;window_peak_=0;scoped_=true;
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoUserClient::close()
+@@ -85,7 +113,7 @@ IOReturn NativeAdrenoUserClient::close()
+     if(liveObjects() || submit_->rangeOutstanding(queue_base_,NativeAdrenoAbiMaxQueues))return kIOReturnBusy;
+     for(size_t i=1;i<NativeAdrenoAbiMaxQueues;++i)if(queues_[i].active)return kIOReturnBusy;
+     IODeleteData(entries_,Entry,entry_count_);entry_count_=0;
+-    queue_base_=0;window_start_=window_bytes_=window_peak_=0;
++    queue_base_=0;window_start_=window_bytes_=window_peak_=0;scoped_=false;
+     open_=false;for(auto &queue:queues_)queue=Queue{};vm_=nullptr;submit_=nullptr;ring_=nullptr;timer_=nullptr;status_=nullptr;info_=nullptr;
+     return kIOReturnSuccess;
+ }
+@@ -132,12 +160,15 @@ IOReturn NativeAdrenoUserClient::allocBo(const NativeAdrenoAbiBoAlloc *request,
+         request->align_log2<12 || request->align_log2>24 || request->contiguous>1)
+         return kIOReturnBadArgument;
+     Entry *entry=free();
+-    if(!entry)return kIOReturnNoResources;
+-    /* A scattered allocation costs one VM span per physical page (int-030: 16 MiB came back as 4096 single-page spans, the
+-     * whole span table), so larger objects try one contiguous run first and fall back to scattered pages unless the
+-     * caller demanded contiguity. */
++    if(!entry) {
++        noteAllocFailure(kIOReturnNoResources,1,liveObjects(),request,window_peak_,this);
++        return kIOReturnNoResources;
++    }
++    /* The board now has a 131072-span VM. An optional contiguous-first attempt can scan and compact the whole VM under the
++     * shared connection lock before falling back, blocking every GPU client. Ordinary BOs therefore take the existing pool or
++     * scattered path directly. A caller that requires physical contiguity still gets exactly one contiguous attempt. */
+     IOReturn status=kIOReturnUnsupported;
+-    const bool prefer_contiguous=request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes;
++    const bool prefer_contiguous=native_adreno_contiguous_first && request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes;
+     if(prefer_contiguous) {
+         status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes,true);
+         if(status && !entry->memory.quarantined() && entry->memory.release()==kIOReturnSuccess)status=kIOReturnUnsupported;
+@@ -149,13 +180,18 @@ IOReturn NativeAdrenoUserClient::allocBo(const NativeAdrenoAbiBoAlloc *request,
+      * (the kernel's cacheable alias read zeros past the first line too). Turnip maps every BO asking kIOMapWriteCombineCache, the user's
+      * cache bits replace the kernel's (IOUserClient::mapClientMemory64), and XNU's view machinery changes the page attribute to match, so
+      * the aliases disagreed. A coherent own BO needs a client that asks for a write-back view. */
+-    if(!status && native_adreno_wc_enabled)status=entry->memory.makeWriteCombined();
++    uint32_t failure_phase=2;
++    if(!status && native_adreno_wc_enabled) {
++        failure_phase=3;
++        status=entry->memory.makeWriteCombined();
++    }
+     if(status) {
+         /* A failed allocation can leave quarantine behind; never reuse it. */
+         clear(*entry);
+         if(entry->memory.release()!=kIOReturnSuccess) {
+             entry->used=true;entry->unreleasable=true;
+         }
++        noteAllocFailure(status,failure_phase,liveObjects(),request,window_peak_,this);
+         return status==kIOReturnUnsupported?kIOReturnUnsupported:status;
+     }
+     entry->used=true;entry->handle=next_handle_++;entry->token=(uint32_t)(entry-entries_)+1;
+diff --git a/NativeAdrenoUserClient.h b/NativeAdrenoUserClient.h
+index bcd1728..189f178 100644
+--- a/NativeAdrenoUserClient.h
++++ b/NativeAdrenoUserClient.h
+@@ -13,7 +13,7 @@
+  * pointer values. A mapping is retirable only through freeBo, which unmaps
+  * first and then releases the backing object; both steps must succeed.
+  * Up to NativeAdrenoClientMaxObjects live objects and the execbuf's own eight-job limit apply. */
+-enum : size_t {NativeAdrenoClientMaxObjects=1024,NativeAdrenoClientContiguousFirstBytes=65536};
++enum : size_t {NativeAdrenoClientMaxObjects=4096,NativeAdrenoClientContiguousFirstBytes=65536};
+ class NativeAdrenoUserClient final {
+     struct Queue {uint32_t id=0;bool active=false;};
+     struct Entry {
+@@ -43,6 +43,9 @@ class NativeAdrenoUserClient final {
+     /* Scope on the shared ring and GPU space: this client's queues are the submit object's queues [queue_base_, +MaxQueues), and with a
+      * window (window_bytes_ nonzero) every mapping must lie inside [window_start_, +window_bytes_), which GetDeviceInfo reports as the VA. */
+     uint32_t queue_base_=0;
++    /* setScope has given this client its range. Before that queue_base_ 0 names the render server's range, not this client's: a new
++     * connection must not wait on (or be refused for) the render server's work in flight. */
++    bool scoped_=false;
+     uint64_t window_start_=0,window_bytes_=0,window_peak_=0;
+     uint64_t next_handle_=1;
+     bool open_=false;
+diff --git a/NativeAdrenoVm.h b/NativeAdrenoVm.h
+index c82544d..3c4bd19 100644
+--- a/NativeAdrenoVm.h
++++ b/NativeAdrenoVm.h
+@@ -26,7 +26,11 @@ struct NativeAdrenoVmResult {
+  * only the owned streams. Uncertain resources require independent real reset.
+  * No VM may be advertised to apps until per-client isolation, submission
+  * validation/protection, genuine IRQ fences and reset are implemented. */
+-enum : size_t {NativeAdrenoVmMaxObjects=1024};
++/* One VM is shared by three published clients, each with 1024 BO slots, plus
++ * the kernel's firmware/ring/fence mappings. A per-client-sized shared table
++ * rejects otherwise valid mappings when the aggregate reaches 1024. Keep
++ * enough bounded metadata for every client plus kernel mappings. */
++enum : size_t {NativeAdrenoVmMaxObjects=4096};
+ /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
+ extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
+ /* The board's reader through the kernel's cacheable physical aperture (null on the host: the BO's own mapping is read). */
+diff --git a/tests/XnuMemoryFixture.h b/tests/XnuMemoryFixture.h
+index 5d1fa13..118d390 100644
+--- a/tests/XnuMemoryFixture.h
++++ b/tests/XnuMemoryFixture.h
+@@ -10,6 +10,8 @@
+ #include <vector>
+ using IOReturn=int;
+ using IOOptionBits=unsigned;
++using IODirection=unsigned;
++constexpr unsigned kIOMemoryPersistent=0x10000;
+ using IOByteCount=size_t;
+ using addr64_t=uint64_t;
+ constexpr IOReturn kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnBusy=2,
+@@ -24,6 +26,8 @@ class IOBufferMemoryDescriptor;
+ struct MemoryFixture {
+     unsigned created=0,prepared=0,completed=0,released=0,cache_calls=0,segment_calls=0;
+     unsigned allocation_fail_count=0;
++    unsigned contiguous_requests=0,scattered_requests=0;
++    bool persistent_import_refused=false;
+     bool allocation_fail=false,prepare_fail=false,complete_fail=false,metadata_fail=false;
+     bool write_protected_imports=false;   /* user ranges that can only be pinned for reading: prepare() of a writable one reports KERN_PROTECTION_FAILURE */
+     bool null_mapping=false,unaligned_mapping=false,wrong_length=false;
+@@ -58,6 +62,7 @@ public:
+     bool contiguous=false;
+     static IOBufferMemoryDescriptor *inTaskWithPhysicalMask(void *task,unsigned options,size_t bytes,uint64_t mask) {
+         if(task!=kernel_task || !(options&kIOMemoryMapperNone))std::abort();
++        if(options&kIOMemoryPhysicallyContiguous)++fixture.contiguous_requests;else ++fixture.scattered_requests;
+         if(fixture.allocation_fail)return nullptr;
+         if(fixture.allocation_fail_count) {--fixture.allocation_fail_count;return nullptr;}
+         if(fixture.contiguous_limit && (options&kIOMemoryPhysicallyContiguous) && bytes>fixture.contiguous_limit)return nullptr;
+@@ -100,6 +105,7 @@ public:
+     static IOMemoryDescriptor *withAddressRange(uint64_t address,uint64_t bytes,unsigned options,task_t task) {
+         if(!task || task==kernel_task || !(options&kIOMemoryMapperNone))std::abort();
+         if(fixture.allocation_fail)return nullptr;
++        if(fixture.persistent_import_refused && (options&kIOMemoryPersistent))return nullptr;
+         auto *d=new IOMemoryDescriptor;d->options=options;d->address=address;d->bytes=bytes;d->physical_base=fixture.next_physical;
+         fixture.next_physical+=2*bytes+0x10000;++fixture.imported;++fixture.imports_live;return d;
+     }
+diff --git a/tests/hostsim/host_gpu_service.cpp b/tests/hostsim/host_gpu_service.cpp
+index de8e1a0..6b8cb84 100644
+--- a/tests/hostsim/host_gpu_service.cpp
++++ b/tests/hostsim/host_gpu_service.cpp
+@@ -92,9 +92,8 @@ bool build() {
+     static const ArmSmmu4KIo io{nullptr,kSmmuBytes,sread32,sread64,swrite32,swrite64,sbarrier};
+     context=new NativeAdrenoGpuContext;
+     NativeAdrenoGmuContextReport report;
+-    const unsigned slots[2]={2,3};
+-    const uint16_t sids[2]={0,1};
+-    const IOReturn up=context->bringUp(&io,1,2,slots,sids,nullptr,&report);
++    const ArmSmmu4KStream routes[2]={{2,0},{3,1}};
++    const IOReturn up=context->bringUp(&io,1,2,routes,2,nullptr,&report);
+     if(up!=kIOReturnSuccess) {std::fprintf(stderr,"host gpu: context bring-up failed %d at step %u\n",up,report.step);return false;}
+     const NativeAdrenoMemory &ringmem=context->buffer(1),&memory=context->buffer(2);
+     memptrs=static_cast<volatile uint32_t *>(memory.mapping());
+diff --git a/tests/hostsim/host_iokit_shim.cpp b/tests/hostsim/host_iokit_shim.cpp
+index dc5be6d..b1926c8 100644
+--- a/tests/hostsim/host_iokit_shim.cpp
++++ b/tests/hostsim/host_iokit_shim.cpp
+@@ -8,6 +8,9 @@
+ #include <cstring>
+ #include <cstdio>
+ #include <unistd.h>
++#include <time.h>
++#include <errno.h>
++#include <atomic>
+ static bool trace(){static int t=-1;if(t<0)t=getenv("HOSTSIM_TRACE")?1:0;return t;}
+ 
+ extern "C" {
+@@ -41,51 +44,79 @@ static uint32_t gOpenKind;   /* 1 direct, 2 tunnel only */
+     __attribute__((used)) static const struct {const void *with; const void *what;} interpose_##replacee \
+     __attribute__((section("__DATA,__interpose"))) = {reinterpret_cast<const void *>(&replacement), reinterpret_cast<const void *>(&replacee)}
+ 
++static void stallBoAlloc(uint32_t method) {
++    static std::atomic_flag injected=ATOMIC_FLAG_INIT;
++    const char *delay=getenv("HOSTSIM_STALL");
++    if(method!=2 || !delay || injected.test_and_set())return;
++    const unsigned seconds=(unsigned)atoi(delay);
++    fprintf(stderr,"hostsim: BoAlloc stall injected (%u seconds)\n",seconds);
++    struct timespec remaining={(time_t)seconds,0};
++    while(nanosleep(&remaining,&remaining) && errno==EINTR) {}
++}
++
+ extern "C" {
+ static CFMutableDictionaryRef shim_IOServiceMatching(const char *name) {
+     if(trace())fprintf(stderr,"shim: IOServiceMatching(%s)\n",name);
+     if(!strcmp(name,"NativeAdrenoGpuPublished"))return reinterpret_cast<CFMutableDictionaryRef>(1);
+     if(!strcmp(name,"IOAcceleratorES"))return reinterpret_cast<CFMutableDictionaryRef>(2);
+-    return nullptr;
++    return IOServiceMatching(name);
+ }
+-static io_service_t shim_IOServiceGetMatchingService(mach_port_t,CFDictionaryRef matching) {
++static io_service_t shim_IOServiceGetMatchingService(mach_port_t mainPort,CFDictionaryRef matching) {
+     if(trace())fprintf(stderr,"shim: IOServiceGetMatchingService(%p)\n",(const void *)matching);
+-    return static_cast<io_service_t>(reinterpret_cast<uintptr_t>(matching));
++    if(matching==reinterpret_cast<CFDictionaryRef>(1) || matching==reinterpret_cast<CFDictionaryRef>(2))
++        return static_cast<io_service_t>(reinterpret_cast<uintptr_t>(matching));
++    return IOServiceGetMatchingService(mainPort,matching);
+ }
+-static kern_return_t shim_IOServiceOpen(io_service_t service,task_port_t,uint32_t type,io_connect_t *connect) {
++static kern_return_t shim_IOServiceOpen(io_service_t service,task_port_t task,uint32_t type,io_connect_t *connect) {
+     if(trace())fprintf(stderr,"shim: IOServiceOpen(%u, 0x%x)\n",service,type);
+-    if(service!=1 && service!=2)return kIOReturnBadArgument;
++    if(service!=1 && service!=2) {
++        return IOServiceOpen(service,task,type,connect);
++    }
+     if(service==2 && type!=0x4147)return kIOReturnNotPermitted;
+     const kern_return_t kr=translate(host_gpu_open());
+     if(trace())fprintf(stderr,"shim: open -> 0x%x\n",kr);
+     if(kr==KERN_SUCCESS) {*connect=7;gOpenKind=service;}
+     return kr;
+ }
+-static kern_return_t shim_IOServiceClose(io_connect_t) {return translate(host_gpu_close());}
+-static kern_return_t shim_IOObjectRelease(io_object_t) {return KERN_SUCCESS;}
+-static kern_return_t shim_IOConnectCallStructMethod(mach_port_t,uint32_t selector,const void *in,size_t in_size,void *out,size_t *out_size) {
++static kern_return_t shim_IOServiceClose(io_connect_t connection) {
++    if(connection==7)return translate(host_gpu_close());
++    return IOServiceClose(connection);
++}
++static kern_return_t shim_IOObjectRelease(io_object_t object) {
++    if(object==1 || object==2)return KERN_SUCCESS;
++    return IOObjectRelease(object);
++}
++static kern_return_t shim_IOConnectCallStructMethod(mach_port_t connection,uint32_t selector,const void *in,size_t in_size,void *out,size_t *out_size) {
++    if(connection!=7) {
++        return IOConnectCallStructMethod(connection,selector,in,in_size,out,out_size);
++    }
+     if(gOpenKind==2) {
+         if(selector!=kAdmitted)return kIOReturnNotPermitted;
+         const uint32_t *header=static_cast<const uint32_t *>(in);
+         if(!in || in_size<8 || header[0]!=kTunnelMagic)return kIOReturnBadArgument;
+         if(header[1]==0xffffffffu)return KERN_SUCCESS;
+-        /* HOSTSIM_STALL=<seconds>: the first BoAlloc (the first call vkCreateDevice makes) blocks that long, to exercise the plugin's watchdog. */
+-        static bool stalled=false;
+-        if(header[1]==2 && !stalled && getenv("HOSTSIM_STALL")) {stalled=true;sleep((unsigned)atoi(getenv("HOSTSIM_STALL")));}
++        stallBoAlloc(header[1]);
+         const int status=host_gpu_call(header[1],static_cast<const uint8_t *>(in)+8,in_size-8,out,out_size?*out_size:0);
+         if(trace())fprintf(stderr,"shim: method %u first word 0x%llx -> %d\n",header[1],in_size>=16?(unsigned long long)*reinterpret_cast<const uint64_t *>(static_cast<const uint8_t *>(in)+8):0ull,status);
+         if(trace() && status)fprintf(stderr,"shim: method %u (in %zu, out %zu) -> fixture status %d\n",header[1],in_size-8,out_size?*out_size:0,status);
+         return translate(status);
+     }
++    stallBoAlloc(selector);
+     return translate(host_gpu_call(selector,in,in_size,out,out_size?*out_size:0));
+ }
+-static kern_return_t shim_IOConnectMapMemory64(io_connect_t,uint32_t type,task_port_t,mach_vm_address_t *address,mach_vm_size_t *size,IOOptionBits) {
++static kern_return_t shim_IOConnectMapMemory64(io_connect_t connection,uint32_t type,task_port_t task,mach_vm_address_t *address,mach_vm_size_t *size,IOOptionBits options) {
++    if(connection!=7) {
++        return IOConnectMapMemory64(connection,type,task,address,size,options);
++    }
+     void *mapping=nullptr;uint64_t bytes=0;
+     const kern_return_t kr=translate(host_gpu_map(type,&mapping,&bytes));
+     if(kr==KERN_SUCCESS) {*address=reinterpret_cast<mach_vm_address_t>(mapping);*size=bytes;}
+     return kr;
+ }
+-static kern_return_t shim_IOConnectUnmapMemory64(io_connect_t,uint32_t,task_port_t,mach_vm_address_t) {
++static kern_return_t shim_IOConnectUnmapMemory64(io_connect_t connection,uint32_t type,task_port_t task,mach_vm_address_t address) {
++    if(connection!=7) {
++        return IOConnectUnmapMemory64(connection,type,task,address);
++    }
+     return getenv("HOSTSIM_FAIL_USER_UNMAP") ? kIOReturnIOError : KERN_SUCCESS;
+ }
+ /* HOSTSIM_PAGE_SIZE=4096: Turnip sizes and places BOs with the page size (os_get_page_size, getpagesize), 16 KiB on this Mac and 4 KiB on the
+diff --git a/tests/test_gmuctx.cpp b/tests/test_gmuctx.cpp
+index 39286b9..229a3f9 100644
+--- a/tests/test_gmuctx.cpp
++++ b/tests/test_gmuctx.cpp
+@@ -34,6 +34,8 @@ static int write32(void *,size_t at,uint32_t v)
+ static int write64(void *,size_t at,uint64_t v)
+ {CHECK(at%8==0 && at<=SMMU_BYTES-8);if(peer.frozen && at==peer.frozen)return 0;std::memcpy(mmio+at/4,&v,8);return 0;}
+ static int barrier(void *){return 0;}
++static const ArmSmmu4KStream *route(unsigned slot,unsigned sid)
++{static ArmSmmu4KStream r[1];r[0]={slot,uint16_t(sid)};return r;}
+ static unsigned steps[16],step_count;
+ static void progress(uint32_t step){CHECK(step_count<16);steps[step_count++]=step;}
+ int main()
+@@ -44,7 +46,7 @@ int main()
+         reset();step_count=0;
+         NativeAdrenoGmuContext context;
+         NativeAdrenoGmuContextReport report;
+-        CHECK(context.bringUp(&io,1,1,2,5,progress,&report)==kIOReturnSuccess);
++        CHECK(context.bringUp(&io,1,1,route(2,5),1,progress,&report)==kIOReturnSuccess);
+         CHECK(report.step==NativeAdrenoGmuContext::Ready && report.status==kIOReturnSuccess && context.ready());
+         CHECK(step_count==7);
+         for(unsigned i=0;i<7;++i)CHECK(steps[i]==i+1);
+@@ -61,7 +63,26 @@ int main()
+         CHECK(report.ttbr0==((uint64_t(1)<<48)|context.allocator().tables().spans()[0].physical));
+         uint64_t ttbr1;std::memcpy(&ttbr1,mmio+(cb+0x28)/4,8);
+         CHECK((ttbr1&0x0000fffffffff000)==0);
+-        CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)==kIOReturnBusy);   /* one attempt per object */
++        CHECK(context.bringUp(&io,1,1,route(2,5),1,nullptr,&report)==kIOReturnBusy);   /* one attempt per object */
++    }
++    /* The stock iommus mask 0x400 (the gfx_1 TBU): the stream and its alias on two slots, both translating to the bank. */
++    {
++        reset();
++        NativeAdrenoGmuContext context;
++        NativeAdrenoGmuContextReport report;
++        ArmSmmu4KStream routes[2];
++        CHECK(NativeAdrenoRoutes(NATIVE_ADRENO_ROUTE(2,3),NATIVE_ADRENO_STREAM(5,0x400),routes)==2);
++        CHECK(routes[0].slot==2 && routes[0].sid==5 && routes[1].slot==3 && routes[1].sid==0x405);
++        CHECK(context.bringUp(&io,1,1,routes,2,nullptr,&report)==kIOReturnSuccess && report.routes_verified==2);
++        CHECK(mmio[(0x800+8)/4]==((1u<<31)|5) && mmio[(0x800+12)/4]==((1u<<31)|0x405));
++        CHECK((mmio[(0xc00+8)/4]&0x300ff)==1 && (mmio[(0xc00+12)/4]&0x300ff)==1 && report.smr==((1u<<31)|5));
++        CHECK(NativeAdrenoRoutes(2,5,routes)==1 && routes[0].slot==2 && routes[0].sid==5);
++        CHECK(!NativeAdrenoRoutes(NATIVE_ADRENO_ROUTE(2,2),NATIVE_ADRENO_STREAM(5,0x400),routes));   /* same slot */
++        CHECK(!NativeAdrenoRoutes(NATIVE_ADRENO_ROUTE(2,3),NATIVE_ADRENO_STREAM(5,0x401),routes));   /* two mask bits */
++        CHECK(!NativeAdrenoRoutes(NATIVE_ADRENO_ROUTE(2,3),5,routes));   /* alias slot without a mask */
++        CHECK(!NativeAdrenoRoutes(2,NATIVE_ADRENO_STREAM(5,0x400),routes));   /* mask without an alias slot */
++        CHECK(!NativeAdrenoRoutes(NATIVE_ADRENO_ROUTE(2,3),NATIVE_ADRENO_STREAM(0x405,0x400),routes));   /* id has the bit */
++        CHECK(!NativeAdrenoRoutes(128,5,routes));
+     }
+     /* A S2CR that reads back other than FAULT (the apps SMMU stored BYPASS writes as FAULT; here the reverse
+      * case) is refused at attach, after the bank was programmed; the SMR stays invalid. */
+@@ -70,7 +91,7 @@ int main()
+         mmio[(0xc00+8)/4]=0x10000;
+         NativeAdrenoGmuContext context;
+         NativeAdrenoGmuContextReport report;
+-        CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)!=kIOReturnSuccess);
++        CHECK(context.bringUp(&io,1,1,route(2,5),1,nullptr,&report)!=kIOReturnSuccess);
+         CHECK(report.step==NativeAdrenoGmuContext::Attach && report.program_enabled && !report.routes_verified);
+         CHECK(!(mmio[(0x800+8)/4]&(1u<<31)) && !context.ready());
+     }
+@@ -79,7 +100,7 @@ int main()
+         reset();peer.frozen=cb+0x30;   /* TCR */
+         NativeAdrenoGmuContext context;
+         NativeAdrenoGmuContextReport report;
+-        CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)!=kIOReturnSuccess);
++        CHECK(context.bringUp(&io,1,1,route(2,5),1,nullptr,&report)!=kIOReturnSuccess);
+         CHECK(report.step==NativeAdrenoGmuContext::Program && !report.program_enabled);
+         CHECK(report.mismatch==(1u<<2) && report.image.tcr==0);   /* only TCR differs; the banner names it */
+         CHECK(!(mmio[cb/4]&1) && !(mmio[(0x800+8)/4]&(1u<<31)));
+@@ -89,7 +110,7 @@ int main()
+         reset();mmio[cb/4]=1;
+         NativeAdrenoGmuContext context;
+         NativeAdrenoGmuContextReport report;
+-        CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)!=kIOReturnSuccess);
++        CHECK(context.bringUp(&io,1,1,route(2,5),1,nullptr,&report)!=kIOReturnSuccess);
+         CHECK(report.step==NativeAdrenoGmuContext::Program && report.program_writes==0);
+     }
+     /* A 36-bit OAS gives a 36-bit context (TCR2.PASize 1) and allocations below 2^36. */
+@@ -97,7 +118,7 @@ int main()
+         reset();mmio[0x28/4]=0x1413;   /* OAS code 1 */
+         NativeAdrenoGmuContext context;
+         NativeAdrenoGmuContextReport report;
+-        CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)==kIOReturnSuccess && report.output_bits==36);
++        CHECK(context.bringUp(&io,1,1,route(2,5),1,nullptr,&report)==kIOReturnSuccess && report.output_bits==36);
+         CHECK((mmio[(cb+0x10)/4]&7)==1);
+         CHECK(context.allocator().tables().spans()[0].physical+0x1000*NativeAdrenoGmuContext::TablePages<=(UINT64_C(1)<<36));
+     }
+@@ -106,7 +127,7 @@ int main()
+         reset();mmio[0x28/4]=0x14f3;
+         NativeAdrenoGmuContext context;
+         NativeAdrenoGmuContextReport report;
+-        CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)==kIOReturnUnsupported);
++        CHECK(context.bringUp(&io,1,1,route(2,5),1,nullptr,&report)==kIOReturnUnsupported);
+         CHECK(report.step==NativeAdrenoGmuContext::Allocate && !context.allocator().ready() && !(mmio[cb/4]&1));
+     }
+     /* No AArch64 4 KiB granule (ID2.PTFS_4K clear): the kit refuses in phase 1 with no write, the case int-006
+@@ -115,7 +136,7 @@ int main()
+         reset();mmio[0x28/4]=0x0433;
+         NativeAdrenoGmuContext context;
+         NativeAdrenoGmuContextReport report;
+-        CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)!=kIOReturnSuccess);
++        CHECK(context.bringUp(&io,1,1,route(2,5),1,nullptr,&report)!=kIOReturnSuccess);
+         CHECK(report.step==NativeAdrenoGmuContext::Program && report.program_phase==1 && report.program_writes==0);
+         CHECK(report.program_status==ArmSmmu4KUnsupported);
+     }
+@@ -125,7 +146,7 @@ int main()
+         reset();mmio[0x28/4]=0x5511;peer.tbi=1;
+         NativeAdrenoGmuContext context;
+         NativeAdrenoGmuContextReport report;
+-        CHECK(context.bringUp(&io,1,1,2,5,nullptr,&report)==kIOReturnSuccess && report.step==NativeAdrenoGmuContext::Ready);
++        CHECK(context.bringUp(&io,1,1,route(2,5),1,nullptr,&report)==kIOReturnSuccess && report.step==NativeAdrenoGmuContext::Ready);
+         CHECK(report.output_bits==36 && mmio[(cb+0x10)/4]==0x38071 && report.mismatch==((1u<<3)|(1u<<8)));
+         CHECK(mmio[cb/4]==0x167);
+         CHECK(report.smr==((1u<<31)|5) && (report.s2cr&0xff)==1 && (report.sctlr&1));
+@@ -135,11 +156,11 @@ int main()
+         reset();
+         NativeAdrenoGmuContext context;
+         NativeAdrenoGmuContextReport report;
+-        CHECK(context.bringUp(nullptr,1,1,2,5,nullptr,&report)==kIOReturnBadArgument);
+-        CHECK(context.bringUp(&io,64,1,2,5,nullptr,&report)==kIOReturnBadArgument);
+-        CHECK(context.bringUp(&io,1,0,2,5,nullptr,&report)==kIOReturnBadArgument);
+-        CHECK(context.bringUp(&io,1,1,128,5,nullptr,&report)==kIOReturnBadArgument);
+-        CHECK(context.bringUp(&io,1,1,2,5,nullptr,nullptr)==kIOReturnBadArgument);
++        CHECK(context.bringUp(nullptr,1,1,route(2,5),1,nullptr,&report)==kIOReturnBadArgument);
++        CHECK(context.bringUp(&io,64,1,route(2,5),1,nullptr,&report)==kIOReturnBadArgument);
++        CHECK(context.bringUp(&io,1,0,route(2,5),1,nullptr,&report)==kIOReturnBadArgument);
++        CHECK(context.bringUp(&io,1,1,route(128,5),1,nullptr,&report)==kIOReturnBadArgument);
++        CHECK(context.bringUp(&io,1,1,route(2,5),1,nullptr,nullptr)==kIOReturnBadArgument);
+         CHECK(report.step==0);
+     }
+     /* The board entry over the kit's direct MMIO adapter on a plain array. A plain array has no
+@@ -157,7 +178,7 @@ int main()
+         CHECK(NativeAdrenoGmuContextPayloads(payloads)==kIOReturnNotReady && !payloads[4].bytes);
+         CHECK(NativeAdrenoGmuContextPayloads(nullptr)==kIOReturnBadArgument);
+     }
+-    std::printf("PASS: 1 complete GMU context bring-up with exact routes and TTBR0, 1 non-FAULT S2CR, 1 ignored "
++    std::printf("PASS: 1 complete GMU context bring-up with exact routes and TTBR0, 1 TBU-alias pair with 7 route refusals, 1 non-FAULT S2CR, 1 ignored "
+         "context write, 1 enabled-bank refusal, 1 36-bit OAS context, 1 sheng-observed ID2/TCR2 context, 2 ID2 refusals, 5 argument refusals and 1 board entry with a stuck fault status over a software SMMU peer\n");
+ }
+ /* Physical-page maintenance (imported BOs): record it; no host page is touched. */
+diff --git a/tests/test_ring.cpp b/tests/test_ring.cpp
+index 5bdd1d8..2c94aaf 100644
+--- a/tests/test_ring.cpp
++++ b/tests/test_ring.cpp
+@@ -104,6 +104,26 @@ int main()
+         CHECK(r.wait(2,&clock_,5000,&observed)==NativeAdrenoRingFenceArgument);
+         CHECK(r.detach()==kIOReturnSuccess);
+     }
++    /* A6XX framing (useA6xxFence): drm/msm a6xx_submit()'s CCU depth/color invalidates, the user words, then CP_SCRATCH(2) and the
++     * CACHE_FLUSH_TS fence with the interrupt bit; a requested context reset adds nothing (no BV thread, one page table). */
++    {
++        reset();NativeAdrenoRing r;r.useA6xxFence();CHECK(attach(r)==kIOReturnSuccess);
++        const uint32_t words[2]={0x11111111,0x22222222};
++        uint32_t end=0;
++        r.requestContextReset();
++        CHECK(r.submitFramed(words,2,&end)==kIOReturnSuccess && end==1);
++        auto op=[](uint32_t header) {return (header>>28)==7u?(header>>16)&0x7fu:0xffu;};
++        CHECK(op(ring[0])==0x46 && ring[1]==0x18 && op(ring[2])==0x46 && ring[3]==0x19);
++        CHECK(ring[4]==words[0] && ring[5]==words[1]);
++        CHECK((ring[6]>>8&0x3ffffu)==0x885 && (ring[6]&0x3fu)==1 && ring[7]==1);
++        CHECK(op(ring[8])==0x46 && ring[9]==(0x04u|(1u<<31)) && ring[10]==0x108004 && ring[11]==0 && ring[12]==1);
++        CHECK(peer.writes.back().first==0x0807 && peer.writes.back().second==13);
++        CHECK(r.submit(words,1,&end)==kIOReturnSuccess && end==2);   /* plain: words, then the same fence */
++        CHECK(ring[13]==words[0] && op(ring[16])==0x46 && ring[17]==(0x04u|(1u<<31)) && ring[20]==2);
++        CHECK(peer.writes.back().second==21);
++        fence[1]=2;uint32_t observed=0;
++        CHECK(r.wait(2,&clock_,5000,&observed)==NativeAdrenoRingFenceComplete && observed==2 && r.detach()==kIOReturnSuccess);
++    }
+     /* A requested context reset puts a6xx_set_pagetable()'s A7XX context entry into the next framed prologue, once. */
+     {
+         reset();NativeAdrenoRing r;CHECK(attach(r)==kIOReturnSuccess);
+@@ -211,7 +231,7 @@ int main()
+         peer.fail_acquire=peer.acquire+1;
+         uint32_t observed=0;
+         CHECK(r.wait(1,&clock_,10,&observed)==NativeAdrenoRingFencePoisoned && r.poisoned());++cases;
+-        std::printf("PASS: 1 exact ring programming and submission, 1 wrap submission, 1 refused re-attach, 7 write/1 read attach failures and 4 post-commit poison cases over a software CP register peer (%u failure cases)\n",
++        std::printf("PASS: 1 exact ring programming and submission, 1 A6XX framed and plain submission, 1 wrap submission, 1 refused re-attach, 7 write/1 read attach failures and 4 post-commit poison cases over a software CP register peer (%u failure cases)\n",
+             cases);
+     }
+ }
+diff --git a/tests/test_userclient.cpp b/tests/test_userclient.cpp
+index 115f673..0c505d0 100644
+--- a/tests/test_userclient.cpp
++++ b/tests/test_userclient.cpp
+@@ -6,7 +6,11 @@
+ #include <cstring>
+ #include <vector>
+ extern "C" volatile uint32_t native_adreno_io_coherent;
++extern "C" volatile uint32_t native_adreno_contiguous_first;
+ extern "C" volatile uint32_t native_adreno_coherent_skips[4];
++extern "C" volatile uint64_t native_adreno_alloc_diag[20];
++extern "C" volatile uint32_t native_adreno_import_persistent[2];
++static bool fail_write_combine=false;
+ #define CHECK(x) do {if(!(x)){std::fprintf(stderr,"line %d: %s\n",__LINE__,#x);std::exit(1);}}while(0)
+ #define SMMU_BYTES 0x40000
+ #define CB 0x22000
+@@ -107,6 +111,75 @@ static int exposed(Path &p)
+ }
+ int main()
+ {
++    /* Persistent imports, refused memory-entry fallback, read-only retry and failed creation. */
++    {
++        const auto task=reinterpret_cast<void *>(2);
++        const unsigned live=fixture.imports_live, kept=native_adreno_import_persistent[0], fallback=native_adreno_import_persistent[1];
++        NativeAdrenoMemory memory;
++        CHECK(memory.importTask(task,0x20000000,4096,40,4096)==kIOReturnSuccess);
++        CHECK(native_adreno_import_persistent[0]==kept+1 && native_adreno_import_persistent[1]==fallback);
++        CHECK(memory.release()==kIOReturnSuccess && fixture.imports_live==live);
++        fixture.persistent_import_refused=true;
++        CHECK(memory.importTask(task,0x20000000,4096,40,4096)==kIOReturnSuccess);
++        CHECK(native_adreno_import_persistent[1]==fallback+1);
++        CHECK(memory.release()==kIOReturnSuccess && fixture.imports_live==live);
++        fixture.persistent_import_refused=false;fixture.write_protected_imports=true;
++        CHECK(memory.importTask(task,0x20000000,4096,40,4096)==kIOReturnSuccess && memory.readOnly());
++        CHECK(native_adreno_import_persistent[0]==kept+3);
++        CHECK(memory.release()==kIOReturnSuccess && fixture.imports_live==live);
++        fixture.write_protected_imports=false;fixture.allocation_fail=true;
++        CHECK(memory.importTask(task,0x20000000,4096,40,4096)==kIOReturnNoMemory);
++        CHECK(fixture.imports_live==live);fixture.allocation_fail=false;
++        std::puts("PASS: persistent import selection, fallback, read-only retry and failure cleanup; real VM lifetime requires hardware");
++    }
++    /* Terminal allocation diagnostic distinguishes client-table saturation from
++     * actual allocation/WC refusals, survives client close, and ignores success
++     * and recovered contiguous attempts. One map also verifies the window peak. */
++    {
++        Path p;CHECK(exposed(p)==kIOReturnSuccess);
++        CHECK(native_adreno_alloc_diag[0]==1 && native_adreno_alloc_diag[1]==0);
++        NativeAdrenoAbiBoAlloc alloc{4096,12,0};
++        NativeAdrenoAbiBoAllocReply allocated{};
++        for(size_t i=0;i<NativeAdrenoClientMaxObjects;++i) {
++            CHECK(p.client.allocBo(&alloc,&allocated)==kIOReturnSuccess && allocated.handle);
++            if(i==0) {
++                NativeAdrenoAbiBoMap map{allocated.handle,0x800000,3,0,2,0};
++                NativeAdrenoAbiBoMapReply mapped{};
++                CHECK(p.client.mapBo(&map,&mapped)==kIOReturnSuccess && mapped.iova==0x800000);
++            }
++        }
++        CHECK(native_adreno_alloc_diag[1]==0 && p.client.liveObjects()==NativeAdrenoClientMaxObjects);
++        CHECK(p.client.allocBo(&alloc,&allocated)==kIOReturnNoResources && !allocated.handle);
++        CHECK(native_adreno_alloc_diag[1]==1 && native_adreno_alloc_diag[2]==2);
++        CHECK(native_adreno_alloc_diag[3]==kIOReturnNoResources && native_adreno_alloc_diag[4]==1);
++        CHECK(native_adreno_alloc_diag[5]==NativeAdrenoClientMaxObjects && native_adreno_alloc_diag[6]==4096);
++        CHECK(native_adreno_alloc_diag[7]==0x801000 && native_adreno_alloc_diag[8]==(uintptr_t)&p.client);
++        CHECK(native_adreno_alloc_diag[9]==12 && native_adreno_alloc_diag[10]==0 && native_adreno_alloc_diag[19]==NativeAdrenoClientMaxObjects);
++        uint64_t first[8];for(unsigned i=0;i<8;++i)first[i]=native_adreno_alloc_diag[11+i];
++        CHECK(p.client.releaseAll(&ringclock,1000)==kIOReturnSuccess);
++        CHECK(native_adreno_alloc_diag[1]==1); /* close must not erase the refusal */
++        CHECK(p.client.open(NativeAdrenoAbiVersion,&p.vm,&p.execbuf,&p.ring,32,40)==kIOReturnSuccess);
++        fixture.allocation_fail_count=1;
++        CHECK(p.client.allocBo(&alloc,&allocated)==kIOReturnNoMemory && !allocated.handle);
++        CHECK(native_adreno_alloc_diag[1]==2 && native_adreno_alloc_diag[2]==4);
++        CHECK(native_adreno_alloc_diag[3]==kIOReturnNoMemory && native_adreno_alloc_diag[4]==2);
++        CHECK(native_adreno_alloc_diag[5]==0 && native_adreno_alloc_diag[6]==4096);
++        fail_write_combine=true;
++        CHECK(p.client.allocBo(&alloc,&allocated)==kIOReturnIOError && !allocated.handle);
++        fail_write_combine=false;
++        CHECK(native_adreno_alloc_diag[1]==3 && native_adreno_alloc_diag[2]==6);
++        CHECK(native_adreno_alloc_diag[3]==kIOReturnIOError && native_adreno_alloc_diag[4]==3);
++        CHECK(native_adreno_alloc_diag[5]==0 && native_adreno_alloc_diag[6]==4096);
++        NativeAdrenoAbiBoAlloc big{1u<<20,12,0};
++        native_adreno_contiguous_first=1;
++        fixture.allocation_fail_count=1; /* first contiguous attempt fails; scattered succeeds */
++        CHECK(p.client.allocBo(&big,&allocated)==kIOReturnSuccess && allocated.handle);
++        native_adreno_contiguous_first=0;
++        CHECK(native_adreno_alloc_diag[1]==3 && native_adreno_alloc_diag[2]==6);
++        for(unsigned i=0;i<8;++i)CHECK(native_adreno_alloc_diag[11+i]==first[i]);
++        CHECK(p.client.releaseAll(&ringclock,1000)==kIOReturnSuccess);
++        std::puts("PASS: terminal BoAlloc diagnostics distinguish client-slot saturation, physical allocation and WC failure; preserve first refusal/respawn evidence; ignore recovered fallback");
++    }
+     /* Full client transaction: query, allocate, map, submit, wait, free, close. */
+     {
+         Path p;CHECK(exposed(p)==kIOReturnSuccess);
+@@ -509,11 +582,35 @@ int main()
+         CHECK(p.client.waitFence(&future,&ringclock)==kIOReturnBadArgument);
+         CHECK(p.client.close()==kIOReturnSuccess);
+     }
+-    /* Large objects try one contiguous run first and fall back to scattered pages when that fails (and a refused retry). */
++    /* A fragmented VM must never send an ordinary large BO through contiguous search. Real scattered segments still map, submit,
++     * retire and free through the complete production stack. Explicit contiguity remains a hard requirement, not a fallback. */
++    {
++        CHECK(native_adreno_contiguous_first==0);
++        Path p;CHECK(exposed(p)==kIOReturnSuccess);
++        fixture.mode=ScatterUnlessContiguous;fixture.contiguous_limit=4096;
++        const unsigned contiguous=fixture.contiguous_requests,scattered=fixture.scattered_requests;
++        NativeAdrenoAbiBoAlloc big{65536,12,0};NativeAdrenoAbiBoAllocReply allocated{};
++        CHECK(p.client.allocBo(&big,&allocated)==kIOReturnSuccess && allocated.handle);
++        CHECK(fixture.contiguous_requests==contiguous && fixture.scattered_requests==scattered+1);
++        NativeAdrenoAbiBoMap map{allocated.handle,0x800000,3,0,2,0};NativeAdrenoAbiBoMapReply mapped{};
++        CHECK(p.client.mapBo(&map,&mapped)==kIOReturnSuccess && p.vm.spanCount()>=16);
++        NativeAdrenoAbiSubmit submit{};submit.buffer_count=1;submit.buffers[0]={allocated.handle,0x800000,1024};
++        NativeAdrenoAbiSubmitReply reply{};CHECK(p.client.submit(&submit,&reply,&ringclock)==kIOReturnSuccess);
++        fencemem[1]=reply.fence;
++        NativeAdrenoAbiBoAlloc required{65536,12,1};NativeAdrenoAbiBoAllocReply refused{};
++        const unsigned c_before=fixture.contiguous_requests,s_before=fixture.scattered_requests;
++        CHECK(p.client.allocBo(&required,&refused)==kIOReturnNoMemory && !refused.handle);
++        CHECK(fixture.contiguous_requests==c_before+1 && fixture.scattered_requests==s_before);
++        CHECK(p.client.releaseAll(&ringclock,1000)==kIOReturnSuccess);
++        fixture.mode=Contiguous;fixture.contiguous_limit=0;
++        std::puts("PASS: ordinary large BO never attempts contiguous search; scattered pages map, submit, retire and release");
++    }
++    /* Legacy contiguous-first mode remains an explicit runtime comparison, with its original fallback and failure controls. */
+     {
+         Path p;CHECK(exposed(p)==kIOReturnSuccess);
+         NativeAdrenoAbiBoAlloc big{1u<<20,12,0};
+         NativeAdrenoAbiBoAllocReply allocated{};
++        native_adreno_contiguous_first=1;
+         fixture.allocation_fail_count=1;
+         CHECK(p.client.allocBo(&big,&allocated)==kIOReturnSuccess && allocated.handle && fixture.allocation_fail_count==0);
+         NativeAdrenoAbiBoAllocReply second{};
+@@ -521,7 +618,10 @@ int main()
+         CHECK(p.client.allocBo(&big,&second)==kIOReturnNoMemory && !second.handle && fixture.allocation_fail_count==0);
+         NativeAdrenoAbiBoAlloc demanded{1u<<20,12,1};
+         fixture.allocation_fail_count=1; /* a demanded contiguous run is not retried scattered */
++        const unsigned required_before=fixture.contiguous_requests,scatter_before=fixture.scattered_requests;
+         CHECK(p.client.allocBo(&demanded,&second)==kIOReturnNoMemory);
++        CHECK(fixture.contiguous_requests==required_before+1 && fixture.scattered_requests==scatter_before);
++        native_adreno_contiguous_first=0;
+         CHECK(p.client.releaseAll(&ringclock,1000)==kIOReturnSuccess);
+     }
+     /* Version and mount refusals, then a commit that poisons everything. */
+@@ -626,7 +726,8 @@ int main()
+ }
+ /* Physical-page maintenance (imported BOs): record it; no host page is touched. */
+ /* Host double: the page attribute change of user BOs has no host equivalent (no host page is touched). */
+-IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *spans,size_t count,bool){return spans && count?kIOReturnSuccess:kIOReturnBadArgument;}
++IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *spans,size_t count,bool write_combined)
++{return !spans || !count?kIOReturnBadArgument:fail_write_combine && write_combined?kIOReturnIOError:kIOReturnSuccess;}
+ IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *spans,size_t count,uint32_t *reset)
+ {return spans && count && reset?kIOReturnSuccess:kIOReturnBadArgument;}
+ IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,NativeAdrenoCacheOperation op)
+diff --git a/tests/test_vm.cpp b/tests/test_vm.cpp
+index 4d77b8d..b02b802 100644
+--- a/tests/test_vm.cpp
++++ b/tests/test_vm.cpp
+@@ -85,6 +85,33 @@ static IOReturn object(Fixture &s,size_t pages)
+ {return s.object.allocate(pages*4096,40,false,pages*4096);}
+ int main()
+ {
++    /* The shared VM must exceed one client's 1024-object allowance. Model
++     * another client mapping while the first still owns its objects, then
++     * release/reuse a slot and finally drain every mapping. */
++    {
++        constexpr size_t n=1025;
++        Fixture s;CHECK(exposed(s,n+1,n+1)==kIOReturnSuccess);
++        s.aliasScratch.resize(n+1);s.arena.alias_scratch=s.aliasScratch.data();
++        s.arena.alias_scratch_entries=s.aliasScratch.size();
++        std::vector<NativeAdrenoMemory> buffers(n+1);
++        std::vector<uint64_t> handles(n+1);
++        for(size_t i=0;i<n;++i) {
++            CHECK(!buffers[i].allocate(4096,40,false,4096));
++            CHECK(!s.vm.map(&buffers[i],0,0x800000+i*4096,3,0,2,&handles[i]));
++        }
++        CHECK(s.vm.objectCount()==n);
++        CHECK(!s.vm.unmap(handles[512]) && !buffers[512].release());handles[512]=0;
++        CHECK(!buffers[n].allocate(4096,40,false,4096));
++        CHECK(!s.vm.map(&buffers[n],0,0x800000+512*4096,3,0,2,&handles[n]));
++        CHECK(s.vm.objectCount()==n);
++        for(size_t i=0;i<=n;++i)if(handles[i]) {
++            CHECK(!s.vm.unmap(handles[i]) && !buffers[i].release());
++        }
++        CHECK(!s.vm.objectCount() && !s.vm.spanCount());
++        CHECK(!s.vm.detach() && !s.tables.retireAfterQuiescence() && !s.tables.release());
++        CHECK(fixture.live.empty() && fixture.metadata.empty());
++        std::printf("PASS: shared VM maps 1025 objects, reuses a released slot and drains all ownership\n");
++    }
+     /* A real map/hold/unmap transaction across the actual code paths. */
+     {
+         Fixture s;

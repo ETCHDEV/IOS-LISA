@@ -1,0 +1,21 @@
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -564,8 +564,18 @@
+ void
+ slave_machine_init(__unused void *param)
+ {
++	uint32_t lisa_trace = 0;
++	PE_parse_boot_argn("lisa_cpu_trace", &lisa_trace, sizeof(lisa_trace));
+ 	cpu_machine_init();     /* Initialize the processor */
++	if (lisa_trace) {
++		kprintf("LISA CPU: %d after cpu_machine_init DAIF=%llx HPPIR=%llx\n",
++		    cpu_number(), __builtin_arm_rsr64("DAIF"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"));
++	}
+ 	clock_init();           /* Init the clock */
++	if (lisa_trace) {
++		kprintf("LISA CPU: %d after clock_init DAIF=%llx HPPIR=%llx\n",
++		    cpu_number(), __builtin_arm_rsr64("DAIF"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"));
++	}
+ }
+ 
+ /*

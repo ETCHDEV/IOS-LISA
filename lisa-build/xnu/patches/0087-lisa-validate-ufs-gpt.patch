@@ -1,0 +1,104 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -260,7 +260,8 @@
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+ {
+-	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
++	if (!count || lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    count - 1 > UINT32_MAX - lba) {
+ 		return EINVAL;
+ 	}
+ 	uint8_t cdb[10] = {
+@@ -311,26 +312,58 @@
+ 		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
+ 		return ENXIO;
+ 	}
+-	uint64_t entry_lba;
+-	uint32_t nent, esz;
++	uint64_t entry_lba, current, backup, first_usable, last_usable;
++	uint32_t nent, esz, header_size, header_crc, entries_crc;
++	memcpy(&header_size, b + 12, 4);
++	memcpy(&header_crc, b + 16, 4);
++	memcpy(&current, b + 24, 8);
++	memcpy(&backup, b + 32, 8);
++	memcpy(&first_usable, b + 40, 8);
++	memcpy(&last_usable, b + 48, 8);
+ 	memcpy(&entry_lba, b + 72, 8);
+ 	memcpy(&nent, b + 80, 4);
+ 	memcpy(&esz, b + 84, 4);
+-	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
+-		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
+-		return ENXIO;
+-	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	memcpy(&entries_crc, b + 88, 4);
++	if (header_size < 92 || header_size > UFS_BLOCK || current != 1 ||
++	    backup > UINT32_MAX || first_usable > last_usable ||
++	    last_usable >= backup || entry_lba < 2 || esz != 128 ||
++	    nent == 0 || nent > BOUNCE_SIZE / 128) {
++		printf("LISA UFS: invalid GPT header or entry geometry\n");
++		return ENXIO;
++	}
++	uint32_t zero = 0;
++	uint32_t crc = crc32(0, b, 16);
++	crc = crc32(crc, (const uint8_t *)&zero, sizeof(zero));
++	crc = crc32(crc, b + 20, header_size - 20);
++	uint32_t entry_bytes = nent * esz;
++	uint32_t entry_blocks = (entry_bytes + UFS_BLOCK - 1) / UFS_BLOCK;
++	if (crc != header_crc || entry_lba >= first_usable ||
++	    entry_blocks > first_usable - entry_lba) {
++		printf("LISA UFS: GPT header checksum or range invalid\n");
++		return ENXIO;
++	}
++	error = ufs_read_blocks(entry_lba, entry_blocks);
+ 	if (error) {
+ 		return error;
+ 	}
++	if (crc32(0, b, entry_bytes) != entries_crc) {
++		printf("LISA UFS: GPT entry checksum invalid\n");
++		return ENXIO;
++	}
++	bool found = false;
++	uint64_t selected_first = 0, selected_last = 0;
+ 	for (uint32_t i = 0; i < nent; i++) {
+ 		const uint8_t *e = b + i * esz;
+ 		char name[37];
+ 		unsigned c;
+ 		for (c = 0; c < 36; c++) {
+ 			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
+-			if (ch == 0 || ch > 0x7f) {
++			if (ch > 0x7f) {
++				name[0] = 0;
++				c = 0;
++				break;
++			}
++			if (ch == 0) {
+ 				break;
+ 			}
+ 			name[c] = (char)ch;
+@@ -342,11 +375,21 @@
+ 		uint64_t first, last;
+ 		memcpy(&first, e + 32, 8);
+ 		memcpy(&last, e + 40, 8);
+-		if (last < first) {
++		bool used = false;
++		for (unsigned j = 0; j < 16; j++) {
++			used |= e[j] != 0;
++		}
++		if (!used || found || first < first_usable || last > last_usable || last < first) {
++			printf("LISA UFS: invalid or duplicate selected GPT partition\n");
+ 			return ENXIO;
+ 		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
++		found = true;
++		selected_first = first;
++		selected_last = last;
++	}
++	if (found) {
++		su.first_block = selected_first;
++		su.nblocks = selected_last - selected_first + 1;
+ 		return 0;
+ 	}
+ 	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);

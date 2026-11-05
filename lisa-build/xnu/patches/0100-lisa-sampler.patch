@@ -1,0 +1,12 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -825,6 +825,9 @@
+ 	uint32_t lisa_status = 0;
+ 	PE_parse_boot_argn("lisa_status", &lisa_status, sizeof(lisa_status));
+ 	if (lisa_status == 1) lisa_status_start();
++	uint32_t lisa_sample = 0;
++	PE_parse_boot_argn("lisa_sample", &lisa_sample, sizeof(lisa_sample));
++	if (lisa_sample == 1) sweet_sample_start();
+ 	uint32_t lisa_log = 0;
+ 	PE_parse_boot_argn("lisa_ufs_log", &lisa_log, sizeof(lisa_log));
+ 	if (lisa_log == 1) sweet_log_start();

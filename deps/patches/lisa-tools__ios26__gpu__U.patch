@@ -1,0 +1,151 @@
+diff --git a/patches/xnu-12377/00-bcm2837-machine-config.patch b/patches/xnu-12377/00-bcm2837-machine-config.patch
+index 1a09d19..f919cbe 100644
+--- a/patches/xnu-12377/00-bcm2837-machine-config.patch
++++ b/patches/xnu-12377/00-bcm2837-machine-config.patch
+@@ -120,7 +120,10 @@ index 0000000..d6000b6
+ +options     TRASH_VFP_ON_SAVE   # <debug,trash_vfp>
+ +options		ALTERNATE_DEBUGGER	# <alternate_debugger>
+ +
+-+options   CONFIG_VNODES=1024		# <xsmall>
+++# iOS 26 LaunchServices indexes more than 200 system applications during the
+++# first boot.  The xsmall 1024-vnode ceiling leaves lsd permanently cycling
+++# through vnode reclamation, so use the normal memory-sized ceiling.
+++options   CONFIG_VNODES=263168		# <medium>
+ +
+ +options   CONFIG_FREEZE_SUSPENDED_MIN=4		# <xsmall>
+ +
+diff --git a/patches/xnu-12377/native-ios-class-aliases.patch b/patches/xnu-12377/native-ios-class-aliases.patch
+index 51c546d..104b46e 100644
+--- a/patches/xnu-12377/native-ios-class-aliases.patch
++++ b/patches/xnu-12377/native-ios-class-aliases.patch
+@@ -1,6 +1,6 @@
+ --- a/iokit/Kernel/IOUserClient.cpp
+ +++ b/iokit/Kernel/IOUserClient.cpp
+-@@ -419,9 +419,55 @@ IOTaskRegistryCompatibility(task_t task)
++@@ -419,9 +419,58 @@ IOTaskRegistryCompatibility(task_t task)
+  	return false;
+  }
+  
+@@ -16,7 +16,7 @@
+ + */
+ +static const char * const gIOSClassAliases[][2] = {
+ +	{ "IOCoreSurfaceRoot", "IOSurfaceRoot" },
+-+	{ "IOAcceleratorES", "NativeAdrenoGpuPublished" },
+++	{ "IOAcceleratorES", "IOMobileFramebufferLegacy" },
+ +};
+ +
+ +static void
+@@ -29,7 +29,10 @@
+ +	}
+ +	for (const auto & alias : gIOSClassAliases) {
+ +		if (name->isEqualTo(alias[0])) {
+-+			const OSSymbol * replacement = OSSymbol::withCString(alias[1]);
+++			uint32_t lisa_metal = 0;
+++			PE_parse_boot_argn("zeta-gpu-metal", &lisa_metal, sizeof(lisa_metal));
+++			const OSSymbol * replacement = OSSymbol::withCString(
+++			    lisa_metal == 1 && strcmp(alias[0], "IOAcceleratorES") == 0 ? "NativeAdrenoGpuPublished" : alias[1]);
+ +			if (replacement != NULL) {
+ +				matching->setObject(key, replacement);
+ +				replacement->release();
+diff --git a/patches/xnu-12377/zzz-boot-progress.patch b/patches/xnu-12377/zzz-boot-progress.patch
+index bdd546d..d1dcd67 100644
+--- a/patches/xnu-12377/zzz-boot-progress.patch
++++ b/patches/xnu-12377/zzz-boot-progress.patch
+@@ -69,7 +69,7 @@ index 32a5bc6..71aa112 100644
+  	uint32_t i;
+  	int error;
+  	vm_map_t map = current_map();
+-@@ -8188,8 +8192,17 @@ load_init_program(proc_t p)
++@@ -8188,8 +8192,15 @@ load_init_program(proc_t p)
+  	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size,
+  	    VM_MAP_KERNEL_FLAGS_ANYWHERE());
+  #if defined(XNU_OWNER_DATA_MOUNT) && XNU_OWNER_DATA_MOUNT
+@@ -77,17 +77,15 @@ index 32a5bc6..71aa112 100644
+  	int data_error = native_owner_data_prepare(p, (user_addr_t)scratch_addr);
+ +	boot_progress_stage("Data mount returned");
+  	if (data_error) panic("offline scratch Data mount failed: %d", data_error);
+-+#if defined(XNU_BOOT_PROGRESS) && XNU_BOOT_PROGRESS
+ +	extern int sheng_boot_watchdog_policy(void *, uint64_t);
+ +	boot_progress_stage("temporary watchdog launch policy enter");
+ +	int policy_error=sheng_boot_watchdog_policy(p, (uint64_t)scratch_addr);
+ +	if (policy_error) panic("sheng watchdog launch policy failed: %d", policy_error);
+ +	boot_progress_stage("temporary watchdog launch policy ready");
+-+#endif
+  #endif
+  #if CONFIG_MEMORYSTATUS
+  	(void) memorystatus_init_at_boot_snapshot();
+-@@ -8707,6 +8720,7 @@ process_signature(proc_t p, struct image_params *imgp)
++@@ -8707,6 +8718,7 @@ process_signature(proc_t p, struct image_params *imgp)
+  	 * approve of exec, kill and return immediately.
+  	 */
+  	if (imgp->ip_mac_return != 0) {
+@@ -95,7 +93,7 @@ index 32a5bc6..71aa112 100644
+  		KERNEL_DEBUG_CONSTANT(BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXITREASON_CREATE) | DBG_FUNC_NONE,
+  		    proc_getpid(p), OS_REASON_EXEC, EXEC_EXIT_REASON_SECURITY_POLICY, 0, 0);
+  		signature_failure_reason = os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_SECURITY_POLICY);
+-@@ -8883,7 +8897,9 @@ done:
++@@ -8883,7 +8895,9 @@ done:
+  		 * state.
+  		 */
+  
+diff --git a/scripts/add-gpu-plugin-data.py b/scripts/add-gpu-plugin-data.py
+index 489615a..30b3d4f 100644
+--- a/scripts/add-gpu-plugin-data.py
++++ b/scripts/add-gpu-plugin-data.py
+@@ -63,6 +63,30 @@ def main():
+         try:
+             if not (mount / 'mobile').is_dir():
+                 sys.exit('The Data seed has no /mobile; wrong base image?')
++            # Lisa: never auto lock, show every system app.
++            def lisa_plist(rel, values):
++                path = mount / rel
++                path.parent.mkdir(parents=True, exist_ok=True)
++                merged = plistlib.loads(path.read_bytes()) if path.exists() else {}
++                merged.update(values)
++                path.write_bytes(plistlib.dumps(merged, fmt=plistlib.FMT_BINARY))
++                os.chmod(path, 0o666)
++                os.chmod(path.parent, 0o777)
++            lisa_plist('mobile/Library/Preferences/com.apple.springboard.plist', {
++                'SBDontDimOrLockOnAC': True, 'SBDontLockAfterCrash': True, 'SBDontLockEver': True,
++                'SBShowNonDefaultSystemApps': True})
++            never = {'restrictedValue': {'maxInactivity': {'value': 2147483647}}}
++            for rel in ('mobile/Library/UserConfigurationProfiles/EffectiveUserSettings.plist',
++                        'mobile/Library/ConfigurationProfiles/EffectiveUserSettings.plist'):
++                lisa_plist(rel, never)
++            # Lisa: daemons that die and respawn all the time (no hardware behind them) or analyse a Data volume that is new every boot.
++            off = ['com.apple.bluetoothd', 'com.apple.fairplayd.H2', 'com.apple.fairplayd', 'com.apple.wifip2pd',
++                   'com.apple.ReportCrash', 'com.apple.ReportCrash.Root', 'com.apple.ReportCrash.SafetyNet',
++                   'com.apple.coresymbolicationd', 'com.apple.spindump', 'com.apple.tailspind', 'com.apple.analyticsd',
++                   'com.apple.mediaanalysisd', 'com.apple.photoanalysisd', 'com.apple.knowledgeconstructiond',
++                   'com.apple.corecaptured', 'com.apple.imagent', 'com.apple.weatherd', 'com.apple.suggestd',
++                   'com.apple.UARPUpdaterServiceAFU', 'com.apple.speech.speechsynthesisd']
++            lisa_plist('db/com.apple.xpc.launchd/disabled.plist', {name: True for name in off})
+             target = mount / 'ngpu/addons/NativeAdrenoMetal.bundle'
+             if target.exists():
+                 shutil.rmtree(target)
+diff --git a/scripts/build-storage-12377.py b/scripts/build-storage-12377.py
+index 8b0c7b5..528f4f2 100644
+--- a/scripts/build-storage-12377.py
++++ b/scripts/build-storage-12377.py
+@@ -125,7 +125,7 @@ def compile_one(source, record):
+         index += 1
+     command += extra + ['-I', str(ROOT / 'build/storage-abi/include'), '-I', str(SOURCE),
+                 '-I', str(UFS),
+-                '-DNATIVE_UFS_SM8350=1', '-DIOSTORAGE_NATIVE_ONLY=1',
++                '-DNATIVE_UFS_SM8350=1', '-DLISA_UFS_HOST=1', '-DIOSTORAGE_NATIVE_ONLY=1',
+                 '-DNATIVE_UFS_PROGRESS_OBSERVER=0',
+                 # The kernel has no ___chkstk_darwin; NativeRamBlock's store header check has an 8 KiB frame.
+                 '-fno-stack-check',
+diff --git a/scripts/gen-turnip-replay.py b/scripts/gen-turnip-replay.py
+index 664915c..b1b2988 100644
+--- a/scripts/gen-turnip-replay.py
++++ b/scripts/gen-turnip-replay.py
+@@ -21,7 +21,7 @@ HEADER = ROOT / 'build/turnip-smoke/TurnipReplay.h'
+ RD_GPUADDR, RD_BUFFER_CONTENTS, RD_CMDSTREAM_ADDR = 3, 12, 6
+ 
+ if not (HOST / 'plugin_smoke').exists():
+-    subprocess.run([sys.executable, ROOT / 'scripts/check-turnip-darwin-host.py'], check=True)
++    subprocess.run([sys.executable, ROOT / 'scripts/check-turnip-darwin-host.py', '--skip-unavailable-ui-recipes'], check=True)
+ shutil.rmtree(OUT, ignore_errors=True)
+ OUT.mkdir(parents=True)
+ env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(HOST / 'libhostiokit.dylib'), MESA_LOG='', TU_DEBUG='nocb', FD_RD_DUMP='enable', HOSTSIM_PAGE_SIZE='4096',

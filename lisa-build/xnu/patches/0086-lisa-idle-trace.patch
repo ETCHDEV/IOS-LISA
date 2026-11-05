@@ -1,0 +1,37 @@
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -867,6 +867,15 @@
+ 	thread_t                self = current_thread();
+ 
+ 	slave_machine_init(machine_param);
++#if defined(SWEET)
++	uint32_t lisa_trace = 0;
++	PE_parse_boot_argn("lisa_cpu_trace", &lisa_trace, sizeof(lisa_trace));
++	if (lisa_trace) {
++		kprintf("LISA CPU: %d startup returned idle=%d DAIF=%llx HPPIR=%llx\n",
++		    cpu_number(), self == processor->idle_thread,
++		    __builtin_arm_rsr64("DAIF"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"));
++	}
++#endif
+ 
+ 	/*
+ 	 *	If running the idle processor thread,
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -6486,6 +6486,16 @@
+ 	assert(parameter == NULL);
+ 
+ 	processor_t processor = current_processor();
++#if defined(SWEET)
++	static uint32_t lisa_idle_seen[MAX_CPUS];
++	uint32_t lisa_trace = 0;
++	PE_parse_boot_argn("lisa_cpu_trace", &lisa_trace, sizeof(lisa_trace));
++	if (lisa_trace && cpu_number() > 0 && cpu_number() < MAX_CPUS &&
++	    !__atomic_exchange_n(&lisa_idle_seen[cpu_number()], 1, __ATOMIC_RELAXED)) {
++		kprintf("LISA CPU: %d idle entered DAIF=%llx HPPIR=%llx\n",
++		    cpu_number(), __builtin_arm_rsr64("DAIF"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"));
++	}
++#endif
+ 
+ 	/*
+ 	 * Ensure that anything running in idle context triggers

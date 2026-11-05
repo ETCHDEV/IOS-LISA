@@ -1,0 +1,13 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,9 @@
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/* ppnum_t is 32-bit: widen before shifting, or DRAM above 4 GiB
++	 * loses its high address bits during a cache-attribute transition. */
++	flush_dcache(ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP
